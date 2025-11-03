@@ -43,8 +43,6 @@ watchtower-telegram-monitor/
 
 ## 🔧 管理命令
 
-进入容器执行管理操作：
-
 ```bash
 docker exec -it watchtower-monitor manage start
 docker exec -it watchtower-monitor manage status
