@@ -40,15 +40,6 @@ watchtower-telegram-monitor/
 | `ENABLE_ROLLBACK` | 启用自动回滚 | true | ❌ |
 | `MONITORED_CONTAINERS` | 监控容器列表(空=全部) | - | ❌ |
 
-## 🔧 管理命令
-
-进入容器执行管理操作：
-
-```bash
-docker exec -it watchtower-monitor manage start
-docker exec -it watchtower-monitor manage status
-docker exec -it watchtower-monitor manage logs
-```
 
 ## 📖 详细文档
 
