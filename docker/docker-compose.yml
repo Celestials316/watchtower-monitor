@@ -35,7 +35,7 @@ services:
       - "com.centurylinklabs.watchtower.enable=false"
 
   watchtower-notifier:
-    image: yourusername/watchtower-telegram-monitor:latest  # 替换为你的镜像名
+    image: w254992/watchtower-telegram-monitor:latest 
     container_name: watchtower-notifier
     restart: unless-stopped
     network_mode: host
