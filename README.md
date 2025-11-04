@@ -101,7 +101,7 @@
 mkdir -p ~/watchtower && cd ~/watchtower
 
 # 下载配置模板
-curl -o docker-compose.yml https://raw.githubusercontent.com/w254992/watchtower-telegram-monitor/main/docker/docker-compose.yml
+curl -o docker-compose.yml https://raw.githubusercontent.com/Celestials316/watchtower-telegram-monitor/main/docker/docker-compose.yml
 
 # 创建环境变量文件
 cat > .env << 'EOF'
@@ -214,7 +214,7 @@ docker compose up -d
 
 ```bash
 cd ~/watchtower
-curl -o manage.sh https://raw.githubusercontent.com/w254992/watchtower-telegram-monitor/main/scripts/manage.sh
+curl -o manage.sh https://raw.githubusercontent.com/Celestials316/watchtower-telegram-monitor/main/scripts/manage.sh
 chmod +x manage.sh
 
 # 运行管理菜单
@@ -446,8 +446,8 @@ MIT License - 详见 [LICENSE](LICENSE)
 
 ## 📞 支持
 
-- 🐛 [提交 Issue](https://github.com/w254992/watchtower-telegram-monitor/issues)
-- 💬 [讨论区](https://github.com/w254992/watchtower-telegram-monitor/discussions)
+- 🐛 [提交 Issue](https://github.com/Celestials316/watchtower-telegram-monitor/issues)
+- 💬 [讨论区](https://github.com/Celestials316/watchtower-telegram-monitor/discussions)
 - 📧 Email: your.email@example.com
 
 ---
