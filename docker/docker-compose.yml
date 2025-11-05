@@ -27,14 +27,42 @@ services:
         max-file: "3"
     healthcheck:
       test: ["CMD", "sh", "-c", "ps aux | grep -v grep | grep -q watchtower"]
-      interval: 30s
-      timeout: 10s
+      interval: 30秒
+      timeout: 10秒
       retries: 3
-      start_period: 10s
+      start_period: 10秒
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
-    # 如果只监控特定容器，取消下面的注释并添加容器名
-    # command:
+
+  watchtower-notifier:
+    image: w254992/watchtower-telegram-monitor:latest 
+    container_name: watchtower-notifier
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      watchtower:
+        condition: service_started
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./data:/data
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"      
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"    # command:
     #   - nginx
     #   - mysql
     #   - redis
