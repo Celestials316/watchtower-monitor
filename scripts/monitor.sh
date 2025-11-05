@@ -1,6 +1,6 @@
 #!/bin/sh
-# Docker 容器监控通知服务 v3.5.1 - 多服务器统一管理
-# 修复: /check 命令不再重启容器，精简命令列表
+# Docker 容器监控通知服务 v3.6.0 - 快速检查 + 单容器更新
+# 新增: 并行快速检查, 单容器更新命令
 
 echo "正在安装依赖..."
 apk add --no-cache curl docker-cli coreutils grep sed tzdata jq >/dev/null 2>&1
@@ -137,6 +137,26 @@ generate_server_keyboard() {
     echo "$keyboard"
 }
 
+# 生成容器选择键盘
+generate_container_keyboard() {
+    containers=$(docker ps --format '{{.Names}}' | grep -vE '^watchtower|^watchtower-notifier$' | head -20)
+    
+    if [ -z "$containers" ]; then
+        echo ""
+        return
+    fi
+
+    buttons=""
+    for container in $containers; do
+        if [ -n "$buttons" ]; then
+            buttons="$buttons,"
+        fi
+        buttons="$buttons[{\"text\":\"📦 $container\",\"callback_data\":\"/update_exec:$container\"}]"
+    done
+
+    echo "{\"inline_keyboard\":[$buttons]}"
+}
+
 # 发送普通消息
 send_telegram() {
     message="$1"
@@ -214,6 +234,232 @@ answer_callback() {
         -d "text=${text}" >/dev/null 2>&1
 }
 
+# 快速检查单个容器是否有更新
+quick_check_container() {
+    container_name="$1"
+    
+    # 获取当前镜像信息
+    current_image=$(docker inspect --format='{{.Config.Image}}' "$container_name" 2>/dev/null)
+    if [ -z "$current_image" ]; then
+        echo "error|容器不存在"
+        return
+    fi
+    
+    # 拉取最新镜像标签信息(不下载镜像)
+    docker pull "$current_image" >/dev/null 2>&1 &
+    pull_pid=$!
+    
+    # 等待最多30秒
+    timeout=30
+    count=0
+    while kill -0 $pull_pid 2>/dev/null; do
+        if [ $count -ge $timeout ]; then
+            kill $pull_pid 2>/dev/null
+            echo "timeout|检查超时"
+            return
+        fi
+        sleep 1
+        count=$((count + 1))
+    done
+    
+    wait $pull_pid
+    pull_result=$?
+    
+    if [ $pull_result -ne 0 ]; then
+        echo "error|拉取失败"
+        return
+    fi
+    
+    # 比较镜像ID
+    old_id=$(docker inspect --format='{{.Image}}' "$container_name" 2>/dev/null)
+    new_id=$(docker inspect --format='{{.Id}}' "$current_image" 2>/dev/null)
+    
+    if [ "$old_id" != "$new_id" ]; then
+        echo "update|有更新"
+    else
+        echo "latest|已是最新"
+    fi
+}
+
+# 快速并行检查所有容器
+fast_check_all() {
+    msg_id="$1"
+    
+    send_telegram "🚀 <b>快速检查模式</b>
+
+正在并行检查所有容器..." "$msg_id"
+    
+    containers=$(docker ps --format '{{.Names}}' | grep -vE '^watchtower|^watchtower-notifier$')
+    
+    if [ -z "$containers" ]; then
+        send_telegram "❌ 没有需要检查的容器" "$msg_id"
+        return
+    fi
+    
+    total=0
+    has_update=0
+    is_latest=0
+    failed=0
+    update_list=""
+    
+    temp_dir="/tmp/fast_check_$$"
+    mkdir -p "$temp_dir"
+    
+    # 并行检查
+    for container in $containers; do
+        total=$((total + 1))
+        (
+            result=$(quick_check_container "$container")
+            echo "$container|$result" > "$temp_dir/$container.result"
+        ) &
+    done
+    
+    # 等待所有检查完成
+    wait
+    
+    # 收集结果
+    for container in $containers; do
+        if [ -f "$temp_dir/$container.result" ]; then
+            result=$(cat "$temp_dir/$container.result")
+            status=$(echo "$result" | cut -d'|' -f2)
+            
+            case "$status" in
+                "有更新")
+                    has_update=$((has_update + 1))
+                    update_list="$update_list
+🔄 $container"
+                    ;;
+                "已是最新")
+                    is_latest=$((is_latest + 1))
+                    ;;
+                *)
+                    failed=$((failed + 1))
+                    ;;
+            esac
+        fi
+    done
+    
+    rm -rf "$temp_dir"
+    
+    # 发送结果
+    result_msg="✅ <b>检查完成</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📊 <b>检查结果</b>
+   总数: $total
+   有更新: $has_update
+   最新: $is_latest
+   失败: $failed"
+
+    if [ $has_update -gt 0 ]; then
+        result_msg="$result_msg
+
+🔄 <b>有更新的容器:</b>$update_list
+
+💡 执行更新:
+   /update - 选择容器更新
+   /check - 全部更新"
+    fi
+    
+    result_msg="$result_msg
+
+⏱️ <b>检查用时:</b> 约 $((total * 2)) 秒
+━━━━━━━━━━━━━━━━━━━━"
+    
+    send_telegram "$result_msg" "$msg_id"
+}
+
+# 执行单容器更新
+update_single_container() {
+    container_name="$1"
+    msg_id="$2"
+    
+    if ! docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
+        send_telegram "❌ 容器不存在: $container_name" "$msg_id"
+        return
+    fi
+    
+    send_telegram "🔄 正在更新容器: <code>$container_name</code>
+
+请稍候..." "$msg_id"
+    
+    # 保存旧状态
+    old_image_tag=$(docker inspect --format='{{.Config.Image}}' "$container_name" 2>/dev/null)
+    old_image_id=$(docker inspect --format='{{.Image}}' "$container_name" 2>/dev/null)
+    
+    # 使用 watchtower 单独更新这个容器
+    (
+        update_output=$(timeout 180 docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            containrrr/watchtower:latest \
+            --run-once \
+            --cleanup \
+            "$container_name" \
+            2>&1)
+        
+        update_exit=$?
+        
+        if [ $update_exit -eq 124 ]; then
+            send_telegram "⚠️ 更新超时 (3分钟)
+
+容器: <code>$container_name</code>" "$msg_id"
+            return
+        fi
+        
+        if [ $update_exit -ne 0 ]; then
+            send_telegram "❌ 更新失败
+
+容器: <code>$container_name</code>
+退出码: $update_exit" "$msg_id"
+            return
+        fi
+        
+        # 检查是否有更新
+        if echo "$update_output" | grep -q "Updated=1"; then
+            sleep 5
+            
+            # 获取新状态
+            new_image_tag=$(docker inspect --format='{{.Config.Image}}' "$container_name" 2>/dev/null)
+            new_image_id=$(docker inspect --format='{{.Image}}' "$container_name" 2>/dev/null)
+            status=$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || echo "false")
+            
+            old_id_short=$(get_short_id "$old_image_id")
+            new_id_short=$(get_short_id "$new_image_id")
+            
+            if [ "$status" = "true" ]; then
+                send_telegram "✨ <b>更新成功</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器:</b> <code>$container_name</code>
+
+🔄 <b>版本变更:</b>
+   $old_id_short → $new_id_short
+
+✅ 容器已成功启动
+⏰ $(get_time)
+━━━━━━━━━━━━━━━━━━━━" "$msg_id"
+            else
+                send_telegram "⚠️ <b>更新完成但启动失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器:</b> <code>$container_name</code>
+
+🔄 <b>版本变更:</b>
+   $old_id_short → $new_id_short
+
+❌ 容器无法启动
+💡 <code>docker logs $container_name</code>
+━━━━━━━━━━━━━━━━━━━━" "$msg_id"
+            fi
+        else
+            send_telegram "ℹ️ <b>已是最新版本</b>
+
+容器: <code>$container_name</code>
+无需更新" "$msg_id"
+        fi
+    ) &
+}
+
 # 处理回调查询（按钮点击）
 process_callback() {
     callback_id="$1"
@@ -226,25 +472,34 @@ process_callback() {
     fi
 
     command=$(echo "$callback_data" | cut -d':' -f1)
-    target_server_id=$(echo "$callback_data" | cut -d':' -f2)
+    param=$(echo "$callback_data" | cut -d':' -f2-)
 
-    if [ "$target_server_id" != "$SERVER_ID" ]; then
+    # 处理服务器选择
+    if echo "$callback_data" | grep -qE '^/(check|status|list|fastcheck):'; then
+        target_server_id="$param"
+        if [ "$target_server_id" != "$SERVER_ID" ]; then
+            return
+        fi
+        answer_callback "$callback_id" "正在处理..."
+        
+        case "$command" in
+            /check) execute_check_command "" ;;
+            /status) execute_status_command "" ;;
+            /list) execute_list_command "" ;;
+            /fastcheck) fast_check_all "" ;;
+        esac
         return
     fi
 
-    answer_callback "$callback_id" "正在处理..."
+    # 处理单容器更新
+    if [ "$command" = "/update_exec" ]; then
+        container_name="$param"
+        answer_callback "$callback_id" "正在更新 $container_name..."
+        update_single_container "$container_name" ""
+        return
+    fi
 
-    case "$command" in
-        /check)
-            execute_check_command ""
-            ;;
-        /status)
-            execute_status_command ""
-            ;;
-        /list)
-            execute_list_command ""
-            ;;
-    esac
+    answer_callback "$callback_id" "未知操作"
 }
 
 # 执行 status 命令
@@ -280,625 +535,57 @@ execute_status_command() {
     send_telegram "$status_msg" "$msg_id"
 }
 
-# 执行 check 命令 - 快速方案：给 watchtower 发信号
+# 执行 check 命令 - watchtower 全量检查
 execute_check_command() {
     msg_id="$1"
-    
-    # 检查 watchtower 是否运行
-    if ! docker ps --format '{{.Names}}' | grep -q '^watchtower
+    send_telegram "🔄 正在检查更新 (完整模式)
 
-# 执行 list 命令
-execute_list_command() {
-    msg_id="$1"
-    containers=$(docker ps --format '{{.Names}}|@|{{.Image}}|@|{{.Status}}' | grep -vE '^watchtower' | head -20)
+这可能需要几分钟..." "$msg_id"
 
-    if [ -z "$containers" ]; then
-        send_telegram "📦 当前没有运行中的容器" "$msg_id"
-        return
-    fi
+    (
+        echo "[$(date '+%H:%M:%S')] 开始执行完整检查..."
+        
+        check_output=$(timeout 300 docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            containrrr/watchtower:latest \
+            --run-once \
+            --cleanup \
+            --include-restarting \
+            --include-stopped=false \
+            2>&1)
+        
+        check_exit=$?
+        echo "[$(date '+%H:%M:%S')] 检查命令退出码: $check_exit"
 
-    containers_msg="📦 <b>运行中的容器</b>
-
-━━━━━━━━━━━━━━━━━━━━"
-
-    echo "$containers" | while IFS='|' read -r name sep1 image sep2 status; do
-        short_image=$(echo "$image" | sed 's/:latest$//' | head -c 30)
-        containers_msg="${containers_msg}
-🔹 <b>${name}</b>
-   <code>${short_image}</code>
-"
-    done
-
-    count=$(echo "$containers" | wc -l)
-    containers_msg="${containers_msg}
-━━━━━━━━━━━━━━━━━━━━
-共 <b>${count}</b> 个容器"
-
-    send_telegram "$containers_msg" "$msg_id"
-}
-
-# 执行 servers 命令
-execute_servers_command() {
-    msg_id="$1"
-    servers=$(get_online_servers)
-    server_count=$(echo "$servers" | jq 'length')
-
-    if [ "$server_count" -eq 0 ]; then
-        send_telegram "📡 当前没有在线服务器" "$msg_id"
-        return
-    fi
-
-    servers_msg="🌐 <b>在线服务器</b>
-
-━━━━━━━━━━━━━━━━━━━━"
-
-    echo "$servers" | jq -r '.[] | "\(.name)|\(.id)|\(.container_count)"' | while IFS='|' read -r name sid count; do
-        indicator=""
-        if [ "$sid" = "$SERVER_ID" ]; then
-            indicator=" 👈"
+        if [ $check_exit -eq 124 ]; then
+            send_telegram "⚠️ 检查超时（5分钟）" "$msg_id"
+            return
         fi
-        servers_msg="${servers_msg}
-🖥️ <b>${name}</b>${indicator}
-   <code>${sid}</code> | ${count} 个容器
-"
-    done
 
-    servers_msg="${servers_msg}
-━━━━━━━━━━━━━━━━━━━━
-共 ${server_count} 台在线"
+        if [ $check_exit -ne 0 ]; then
+            send_telegram "❌ 检查执行失败
 
-    send_telegram "$servers_msg" "$msg_id"
-}
+退出码: $check_exit" "$msg_id"
+            return
+        fi
 
-# 执行 monitor 命令
-execute_monitor_command() {
-    msg_id="$1"
-    containers="$2"
+        updated=$(echo "$check_output" | grep -o "Updated=[0-9]*" | grep -o "[0-9]*" | head -1 || echo "0")
+        failed=$(echo "$check_output" | grep -o "Failed=[0-9]*" | grep -o "[0-9]*" | head -1 || echo "0")
+        scanned=$(echo "$check_output" | grep -o "Scanned=[0-9]*" | grep -o "[0-9]*" | head -1 || echo "0")
 
-    load_config
+        if [ "$updated" -gt 0 ]; then
+            send_telegram "✅ 检查完成
 
-    if [ -z "$containers" ]; then
-        # 显示当前监控列表
-        if [ -n "$MONITORED_CONTAINERS" ]; then
-            send_telegram "📦 <b>当前监控列表</b>
+📊 扫描: ${scanned} | 更新: ${updated} | 失败: ${failed}
 
-$MONITORED_CONTAINERS
-
-💡 修改: /monitor 容器名
-💡 清空: /monitor all" "$msg_id"
+⏳ 请等待更新详情..." "$msg_id"
         else
-            send_telegram "📦 当前监控所有容器
+            send_telegram "✅ 检查完成
 
-💡 指定监控: /monitor 容器名
-   例如: /monitor nginx mysql" "$msg_id"
+📊 扫描: ${scanned} 个容器
+✨ 全部最新 | 失败: ${failed}" "$msg_id"
         fi
-        return
-    fi
-
-    if [ "$containers" = "all" ]; then
-        MONITORED_CONTAINERS=""
-        save_config
-        send_telegram "✅ 已设置为监控所有容器" "$msg_id"
-    else
-        MONITORED_CONTAINERS="$containers"
-        save_config
-        send_telegram "✅ 监控列表已更新
-
-监控: <code>$containers</code>" "$msg_id"
-    fi
-}
-
-# 处理命令
-process_command() {
-    cmd="$1"
-    msg_id="$2"
-    user_id="$3"
-
-    if [ "$user_id" != "$CHAT_ID" ]; then
-        send_telegram "⛔ 无权限" "$msg_id"
-        return
-    fi
-
-    case "$cmd" in
-        /start|/help)
-            help_msg="🤖 <b>Docker 监控 Bot v3.5.1</b>
-
-━━━━━━━━━━━━━━━━━━━━
-<b>🔍 查询命令</b>
-
-/status - 查看服务状态
-/list - 查看运行中的容器
-/servers - 查看所有在线服务器
-
-<b>🔄 操作命令</b>
-
-/check - 立即检查更新
-/monitor - 查看/设置监控列表
-/monitor all - 监控所有容器
-/monitor 容器名 - 监控指定容器
-
-━━━━━━━━━━━━━━━━━━━━
-<b>💡 多服务器管理</b>
-
-有多个服务器时，命令会显示
-服务器选择按钮
-
-<b>当前服务器:</b> ${SERVER_DISPLAY_NAME}
-<b>服务器ID:</b> <code>${SERVER_ID}</code>"
-            send_telegram "$help_msg" "$msg_id"
-            ;;
-
-        /servers)
-            execute_servers_command "$msg_id"
-            ;;
-
-        /status|/check|/list)
-            servers=$(get_online_servers)
-            server_count=$(echo "$servers" | jq 'length')
-
-            if [ "$server_count" -le 1 ]; then
-                case "$cmd" in
-                    /status) execute_status_command "$msg_id" ;;
-                    /check) execute_check_command "$msg_id" ;;
-                    /list) execute_list_command "$msg_id" ;;
-                esac
-            else
-                keyboard=$(generate_server_keyboard "$cmd")
-                cmd_name=$(echo "$cmd" | sed 's|/||')
-                send_telegram_with_keyboard "🌐 请选择服务器执行 <b>${cmd_name}</b>:" "$keyboard"
-            fi
-            ;;
-
-        /monitor*)
-            containers=$(echo "$cmd" | sed 's/\/monitor\s*//')
-            execute_monitor_command "$msg_id" "$containers"
-            ;;
-
-        *)
-            send_telegram "❌ 未知命令
-
-发送 /help 查看命令列表" "$msg_id"
-            ;;
-    esac
-}
-
-# 心跳任务
-heartbeat_task() {
-    while true; do
-        register_server
-        sleep 30
-    done
-}
-
-# 命令监听后台任务
-command_listener() {
-    echo "启动命令监听器..."
-
-    while true; do
-        updates=$(get_updates)
-
-        if [ -n "$updates" ] && echo "$updates" | grep -q '"ok":true'; then
-            echo "$updates" | jq -r '.result[] | @base64' 2>/dev/null | while read -r update; do
-                decoded=$(echo "$update" | base64 -d 2>/dev/null)
-
-                update_id=$(echo "$decoded" | jq -r '.update_id // empty' 2>/dev/null)
-
-                # 处理普通消息
-                message=$(echo "$decoded" | jq -r '.message.text // empty' 2>/dev/null)
-                msg_id=$(echo "$decoded" | jq -r '.message.message_id // empty' 2>/dev/null)
-                user_id=$(echo "$decoded" | jq -r '.message.from.id // empty' 2>/dev/null)
-
-                # 处理回调查询
-                callback_query=$(echo "$decoded" | jq -r '.callback_query // empty' 2>/dev/null)
-
-                if [ -n "$update_id" ]; then
-                    echo "$update_id" > "$LAST_UPDATE_ID_FILE"
-                fi
-
-                if [ -n "$message" ] && echo "$message" | grep -q '^/'; then
-                    echo "[$(date '+%H:%M:%S')] 收到命令: $message (来自: $user_id)"
-                    process_command "$message" "$msg_id" "$user_id"
-                elif [ "$callback_query" != "null" ] && [ -n "$callback_query" ]; then
-                    callback_id=$(echo "$decoded" | jq -r '.callback_query.id' 2>/dev/null)
-                    callback_data=$(echo "$decoded" | jq -r '.callback_query.data' 2>/dev/null)
-                    from_user=$(echo "$decoded" | jq -r '.callback_query.from.id' 2>/dev/null)
-
-                    echo "[$(date '+%H:%M:%S')] 收到回调: $callback_data"
-                    process_callback "$callback_id" "$callback_data" "$from_user"
-                fi
-            done
-        fi
-
-        sleep 2
-    done
-}
-
-# 获取 danmu 版本
-get_danmu_version() {
-    container_name="$1"
-    check_running="${2:-true}"
-
-    if ! echo "$container_name" | grep -qE "danmu-api|danmu_api"; then
-        echo ""
-        return
-    fi
-
-    version=""
-
-    if [ "$check_running" = "true" ]; then
-        for i in $(seq 1 30); do
-            if docker exec "$container_name" test -f /app/danmu_api/configs/globals.js 2>/dev/null; then
-                break
-            fi
-            sleep 1
-        done
-    fi
-
-    # 使用基础正则避免括号问题
-    version=$(docker exec "$container_name" cat /app/danmu_api/configs/globals.js 2>/dev/null | \
-              grep -m 1 "VERSION:" | sed "s/.*VERSION: '\([^']*\)'.*/\1/" 2>/dev/null)
-    
-    if [ -z "$version" ]; then
-        version=""
-    fi
-
-    echo "$version"
-}
-
-format_version() {
-    img_tag="$1"
-    img_id="$2"
-    container_name="$3"
-
-    tag=$(echo "$img_tag" | grep -oE ':[^:]+
-
-save_container_state() {
-    container="$1"
-    image_tag="$2"
-    image_id="$3"
-    version_info="$4"
-
-    if [ ! -f "$STATE_FILE" ]; then
-        touch "$STATE_FILE"
-    fi
-
-    echo "$container|$image_tag|$image_id|$version_info|$(date +%s)" >> "$STATE_FILE"
-}
-
-get_container_state() {
-    container="$1"
-
-    if [ ! -f "$STATE_FILE" ]; then
-        echo "unknown:tag|sha256:unknown|"
-        return
-    fi
-
-    state=$(grep "^${container}|" "$STATE_FILE" 2>/dev/null | tail -n 1)
-    if [ -z "$state" ]; then
-        echo "unknown:tag|sha256:unknown|"
-        return
-    fi
-
-    echo "$state" | cut -d'|' -f2,3,4
-}
-
-cleanup_old_states() {
-    if [ ! -f "$STATE_FILE" ]; then
-        return
-    fi
-
-    cutoff_time=$(( $(date +%s) - 604800 ))
-    temp_file="${STATE_FILE}.tmp"
-
-    : > "$temp_file"
-
-    if [ -s "$STATE_FILE" ]; then
-        while IFS='|' read -r container image_tag image_id version_info timestamp || [ -n "$container" ]; do
-            [ -z "$container" ] && continue
-
-            if echo "$timestamp" | grep -qE '^[0-9]+$' && [ "$timestamp" -ge "$cutoff_time" ]; then
-                echo "$container|$image_tag|$image_id|$version_info|$timestamp" >> "$temp_file"
-            fi
-        done < "$STATE_FILE"
-    fi
-
-    if [ -f "$temp_file" ]; then
-        mv "$temp_file" "$STATE_FILE" 2>/dev/null || rm -f "$temp_file"
-    fi
-}
-
-echo "=========================================="
-echo "Docker 容器监控通知服务 v3.5.1"
-echo "多服务器统一管理版本"
-echo "服务器: ${SERVER_DISPLAY_NAME}"
-echo "服务器ID: ${SERVER_ID}"
-echo "启动时间: $(get_time)"
-echo "=========================================="
-echo ""
-
-load_config
-cleanup_old_states
-
-echo "正在等待 watchtower 容器完全启动..."
-while true; do
-    if docker inspect -f '{{.State.Running}}' watchtower 2>/dev/null | grep -q "true"; then
-        echo "Watchtower 已启动，准备监控日志"
-        break
-    else
-        sleep 2
-    fi
-done
-
-echo "正在初始化容器状态数据库..."
-for container in $(docker ps --format '{{.Names}}'); do
-    if [ "$container" = "watchtower" ] || [ "$container" = "watchtower-notifier" ]; then
-        continue
-    fi
-
-    image_tag=$(docker inspect --format='{{.Config.Image}}' "$container" 2>/dev/null || echo "unknown:tag")
-    image_id=$(docker inspect --format='{{.Image}}' "$container" 2>/dev/null || echo "sha256:unknown")
-
-    version_info=$(get_danmu_version "$container" "false")
-
-    save_container_state "$container" "$image_tag" "$image_id" "$version_info"
-
-    if [ -n "$version_info" ]; then
-        echo "  → 已保存 $container 的状态到数据库 (版本: v${version_info})"
-    else
-        echo "  → 已保存 $container 的状态到数据库"
-    fi
-done
-
-container_count=$(docker ps --format '{{.Names}}' | grep -vE '^watchtower|^watchtower-notifier$' | wc -l)
-echo "初始化完成，已记录 ${container_count} 个容器状态"
-
-register_server
-echo "服务器已注册到注册表，ID: ${SERVER_ID}"
-
-startup_message="🚀 <b>监控服务启动成功</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📊 <b>服务信息</b>
-   版本: v3.5.1
-   服务器: ${SERVER_DISPLAY_NAME}
-   ID: <code>${SERVER_ID}</code>
-
-🎯 <b>监控状态</b>
-   容器数: ${container_count}
-   检查间隔: $((POLL_INTERVAL / 60))分钟
-
-🤖 <b>交互命令</b>
-   /help - 查看命令列表
-   /check - 手动检查更新
-   /status - 查看状态
-
-⏰ <b>启动时间</b>
-   $(get_time)
-━━━━━━━━━━━━━━━━━━━━
-
-✅ 服务正常运行中"
-
-send_telegram "$startup_message"
-
-heartbeat_task &
-HEARTBEAT_PID=$!
-
-command_listener &
-LISTENER_PID=$!
-
-echo "心跳任务已启动 (PID: $HEARTBEAT_PID)"
-echo "命令监听器已启动 (PID: $LISTENER_PID)"
-echo "开始监控 Watchtower 日志..."
-
-cleanup() {
-    echo "收到退出信号，正在清理..."
-
-    if [ -f "$SERVER_REGISTRY_FILE" ]; then
-        temp_registry="/tmp/servers_cleanup.json"
-        cat "$SERVER_REGISTRY_FILE" | jq --arg sid "$SERVER_ID" \
-            'if .servers[$sid] then .servers[$sid].status = "offline" else . end' \
-            > "$temp_registry" 2>/dev/null
-        mv "$temp_registry" "$SERVER_REGISTRY_FILE" 2>/dev/null
-    fi
-
-    kill $LISTENER_PID 2>/dev/null
-    kill $HEARTBEAT_PID 2>/dev/null
-    rm -f /tmp/session_data.txt
-
-    echo "清理完成，服务已停止"
-    exit 0
-}
-
-trap cleanup INT TERM
-
-# 主循环 - 监控 Watchtower 日志
-docker logs -f --tail 0 watchtower 2>&1 | while IFS= read -r line; do
-    echo "[$(date '+%H:%M:%S')] $line"
-
-    if echo "$line" | grep -q "Stopping /"; then
-        container_name=$(echo "$line" | sed -n 's/.*Stopping \/\([^ ]*\).*/\1/p' | head -n1)
-        if [ -n "$container_name" ]; then
-            echo "[$(date '+%H:%M:%S')] → 捕获到停止: $container_name"
-
-            old_state=$(get_container_state "$container_name")
-            old_image_tag=$(echo "$old_state" | cut -d'|' -f1)
-            old_image_id=$(echo "$old_state" | cut -d'|' -f2)
-            old_version_info=$(echo "$old_state" | cut -d'|' -f3)
-
-            echo "${container_name}|${old_image_tag}|${old_image_id}|${old_version_info}" >> /tmp/session_data.txt
-
-            if [ -n "$old_version_info" ]; then
-                echo "[$(date '+%H:%M:%S')]   → 已暂存旧信息: $old_image_tag ($old_image_id) v${old_version_info}"
-            else
-                echo "[$(date '+%H:%M:%S')]   → 已暂存旧信息: $old_image_tag ($old_image_id)"
-            fi
-        fi
-    fi
-
-    if echo "$line" | grep -q "Session done"; then
-        updated=$(echo "$line" | grep -oP '(?<=Updated=)[0-9]+' || echo "0")
-
-        echo "[$(date '+%H:%M:%S')] → Session 完成: Updated=$updated"
-
-        if [ "$updated" -gt 0 ] && [ -f /tmp/session_data.txt ]; then
-            echo "[$(date '+%H:%M:%S')] → 发现 ${updated} 处更新，立即处理..."
-
-            while IFS='|' read -r container_name old_tag_full old_id_full old_version_info; do
-                [ -z "$container_name" ] && continue
-
-                echo "[$(date '+%H:%M:%S')] → 处理容器: $container_name"
-                sleep 5
-
-                for i in $(seq 1 60); do
-                    status=$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || echo "false")
-                    if [ "$status" = "true" ]; then
-                        echo "[$(date '+%H:%M:%S')]   → 容器已启动"
-                        sleep 5
-                        break
-                    fi
-                    sleep 1
-                done
-
-                status=$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || echo "false")
-                new_tag_full=$(docker inspect --format='{{.Config.Image}}' "$container_name" 2>/dev/null || echo "unknown:tag")
-                new_id_full=$(docker inspect --format='{{.Image}}' "$container_name" 2>/dev/null || echo "sha256:unknown")
-
-                new_version_info=""
-                if echo "$container_name" | grep -qE "danmu-api|danmu_api"; then
-                    if [ "$status" = "true" ]; then
-                        new_version_info=$(get_danmu_version "$container_name" "true")
-                    fi
-                fi
-
-                save_container_state "$container_name" "$new_tag_full" "$new_id_full" "$new_version_info"
-
-                img_name=$(echo "$new_tag_full" | sed 's/:.*$//')
-                time=$(get_time)
-
-                old_tag=$(echo "$old_tag_full" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
-                new_tag=$(echo "$new_tag_full" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
-                old_id_short=$(echo "$old_id_full" | sed 's/sha256://' | head -c 12)
-                new_id_short=$(echo "$new_id_full" | sed 's/sha256://' | head -c 12)
-
-                if [ -n "$old_version_info" ]; then
-                    old_ver_display="v${old_version_info} (${old_id_short})"
-                else
-                    old_ver_display="$old_tag ($old_id_short)"
-                fi
-
-                if [ -n "$new_version_info" ]; then
-                    new_ver_display="v${new_version_info} (${new_id_short})"
-                else
-                    new_ver_display="$new_tag ($new_id_short)"
-                fi
-
-                if [ "$status" = "true" ]; then
-                    message="✨ <b>容器更新成功</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 <b>容器名称</b>
-   <code>${container_name}</code>
-
-🎯 <b>镜像信息</b>
-   <code>${img_name}</code>
-
-🔄 <b>版本变更</b>
-   <code>${old_ver_display}</code>
-   ➜
-   <code>${new_ver_display}</code>
-
-⏰ <b>更新时间</b>
-   <code>${time}</code>
-━━━━━━━━━━━━━━━━━━━━
-
-✅ 容器已成功启动并运行正常"
-
-                    echo "[$(date '+%H:%M:%S')]   → 发送成功通知..."
-                else
-                    message="❌ <b>容器启动失败</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 <b>容器名称</b>
-   <code>${container_name}</code>
-
-🎯 <b>镜像信息</b>
-   <code>${img_name}</code>
-
-🔄 <b>版本变更</b>
-   旧: <code>${old_ver_display}</code>
-   新: <code>${new_ver_display}</code>
-
-⏰ <b>更新时间</b>
-   <code>${time}</code>
-━━━━━━━━━━━━━━━━━━━━
-
-⚠️ 更新后无法启动
-💡 检查: <code>docker logs ${container_name}</code>"
-
-                    echo "[$(date '+%H:%M:%S')]   → 发送失败通知..."
-                fi
-
-                send_telegram "$message"
-
-            done < /tmp/session_data.txt
-
-            rm -f /tmp/session_data.txt
-            echo "[$(date '+%H:%M:%S')] → 所有通知已处理完成"
-
-        elif [ "$updated" -eq 0 ]; then
-            rm -f /tmp/session_data.txt 2>/dev/null
-        fi
-    fi
-
-    if echo "$line" | grep -qiE "level=error.*fatal|level=fatal"; then
-        if echo "$line" | grep -qiE "Skipping|Already up to date|No new images|connection refused.*timeout"; then
-            continue
-        fi
-
-        container_name=$(echo "$line" | sed -n 's/.*container[=: ]\+\([a-zA-Z0-9_.\-]\+\).*/\1/p' | head -n1)
-
-        error=$(echo "$line" | sed -n 's/.*msg="\([^"]*\)".*/\1/p' | head -c 200)
-        [ -z "$error" ] && error=$(echo "$line" | grep -oE "error=.*" | head -c 200)
-        [ -z "$error" ] && error=$(echo "$line" | head -c 200)
-
-        if [ -n "$container_name" ] && [ "$container_name" != "watchtower" ] && [ "$container_name" != "watchtower-notifier" ]; then
-            send_telegram "⚠️ <b>Watchtower 错误</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 <b>容器</b>: <code>$container_name</code>
-🔴 <b>错误</b>: <code>$error</code>
-🕐 <b>时间</b>: <code>$(get_time)</code>
-━━━━━━━━━━━━━━━━━━━━"
-        fi
-    fi
-done
-
-cleanup; then
-        send_telegram "❌ Watchtower 容器未运行
-
-请先启动 Watchtower 服务" "$msg_id"
-        return
-    fi
-    
-    echo "[$(date '+%H:%M:%S')] 触发 Watchtower 手动检查..."
-    
-    # 给 watchtower 发送 USR1 信号触发立即检查
-    if docker kill -s SIGUSR1 watchtower 2>/dev/null; then
-        send_telegram "✅ 已触发更新检查
-
-Watchtower 正在检查所有容器
-如有更新会自动推送通知
-
-💡 提示：检查需要 1-3 分钟
-具体时间取决于容器数量和网络速度" "$msg_id"
-        echo "[$(date '+%H:%M:%S')] ✓ 已发送 SIGUSR1 信号"
-    else
-        send_telegram "❌ 触发检查失败
-
-Watchtower 可能未响应
-请尝试重启服务" "$msg_id"
-        echo "[$(date '+%H:%M:%S')] ✗ 发送信号失败"
-    fi
+    ) &
 }
 
 # 执行 list 命令
@@ -972,7 +659,6 @@ execute_monitor_command() {
     load_config
 
     if [ -z "$containers" ]; then
-        # 显示当前监控列表
         if [ -n "$MONITORED_CONTAINERS" ]; then
             send_telegram "📦 <b>当前监控列表</b>
 
@@ -1002,6 +688,20 @@ $MONITORED_CONTAINERS
     fi
 }
 
+# 执行 update 命令
+execute_update_command() {
+    msg_id="$1"
+    
+    keyboard=$(generate_container_keyboard)
+    
+    if [ -z "$keyboard" ]; then
+        send_telegram "❌ 没有可更新的容器" "$msg_id"
+        return
+    fi
+    
+    send_telegram_with_keyboard "📦 <b>选择要更新的容器:</b>" "$keyboard"
+}
+
 # 处理命令
 process_command() {
     cmd="$1"
@@ -1015,7 +715,7 @@ process_command() {
 
     case "$cmd" in
         /start|/help)
-            help_msg="🤖 <b>Docker 监控 Bot v3.5.1</b>
+            help_msg="🤖 <b>Docker 监控 Bot v3.6.0</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 <b>🔍 查询命令</b>
@@ -1024,18 +724,29 @@ process_command() {
 /list - 查看运行中的容器
 /servers - 查看所有在线服务器
 
-<b>🔄 操作命令</b>
+<b>🔄 检查 & 更新</b>
 
-/check - 立即检查更新
+/fastcheck - ⚡ 快速检查更新
+/check - 🔄 完整检查并更新
+/update - 📦 选择单个容器更新
+
+<b>⚙️ 配置命令</b>
+
 /monitor - 查看/设置监控列表
 /monitor all - 监控所有容器
 /monitor 容器名 - 监控指定容器
 
 ━━━━━━━━━━━━━━━━━━━━
-<b>💡 多服务器管理</b>
+<b>💡 使用技巧</b>
 
-有多个服务器时，命令会显示
-服务器选择按钮
+🚀 <b>快速检查:</b> 并行检查所有容器
+   (仅检查,不更新,速度快)
+
+🔄 <b>完整检查:</b> 检查并自动更新
+   (包含拉取镜像,较慢)
+
+📦 <b>单容器更新:</b> 精确控制
+   (只更新选定的容器)
 
 <b>当前服务器:</b> ${SERVER_DISPLAY_NAME}
 <b>服务器ID:</b> <code>${SERVER_ID}</code>"
@@ -1044,6 +755,18 @@ process_command() {
 
         /servers)
             execute_servers_command "$msg_id"
+            ;;
+
+        /fastcheck)
+            servers=$(get_online_servers)
+            server_count=$(echo "$servers" | jq 'length')
+
+            if [ "$server_count" -le 1 ]; then
+                fast_check_all "$msg_id"
+            else
+                keyboard=$(generate_server_keyboard "/fastcheck")
+                send_telegram_with_keyboard "🌐 请选择服务器执行 <b>快速检查</b>:" "$keyboard"
+            fi
             ;;
 
         /status|/check|/list)
@@ -1061,6 +784,10 @@ process_command() {
                 cmd_name=$(echo "$cmd" | sed 's|/||')
                 send_telegram_with_keyboard "🌐 请选择服务器执行 <b>${cmd_name}</b>:" "$keyboard"
             fi
+            ;;
+
+        /update)
+            execute_update_command "$msg_id"
             ;;
 
         /monitor*)
@@ -1159,7 +886,7 @@ format_version() {
     img_id="$2"
     container_name="$3"
 
-    tag=$(echo "$img_tag" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
+    tag=$(echo "$img_tag" | grep -oE ':[^:]+ | sed 's/://' || echo "latest")
     id_short=$(get_short_id "$img_id")
 
     if echo "$container_name" | grep -qE "danmu-api|danmu_api"; then
@@ -1217,7 +944,7 @@ cleanup_old_states() {
         while IFS='|' read -r container image_tag image_id version_info timestamp || [ -n "$container" ]; do
             [ -z "$container" ] && continue
 
-            if echo "$timestamp" | grep -qE '^[0-9]+$' && [ "$timestamp" -ge "$cutoff_time" ]; then
+            if echo "$timestamp" | grep -qE '^[0-9]+ && [ "$timestamp" -ge "$cutoff_time" ]; then
                 echo "$container|$image_tag|$image_id|$version_info|$timestamp" >> "$temp_file"
             fi
         done < "$STATE_FILE"
@@ -1229,8 +956,8 @@ cleanup_old_states() {
 }
 
 echo "=========================================="
-echo "Docker 容器监控通知服务 v3.5.1"
-echo "多服务器统一管理版本"
+echo "Docker 容器监控通知服务 v3.6.0"
+echo "快速检查 + 单容器更新版本"
 echo "服务器: ${SERVER_DISPLAY_NAME}"
 echo "服务器ID: ${SERVER_ID}"
 echo "启动时间: $(get_time)"
@@ -1270,7 +997,7 @@ for container in $(docker ps --format '{{.Names}}'); do
     fi
 done
 
-container_count=$(docker ps --format '{{.Names}}' | grep -vE '^watchtower|^watchtower-notifier$' | wc -l)
+container_count=$(docker ps --format '{{.Names}}' | grep -vE '^watchtower|^watchtower-notifier | wc -l)
 echo "初始化完成，已记录 ${container_count} 个容器状态"
 
 register_server
@@ -1280,7 +1007,7 @@ startup_message="🚀 <b>监控服务启动成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📊 <b>服务信息</b>
-   版本: v3.5.1
+   版本: v3.6.0
    服务器: ${SERVER_DISPLAY_NAME}
    ID: <code>${SERVER_ID}</code>
 
@@ -1288,10 +1015,14 @@ startup_message="🚀 <b>监控服务启动成功</b>
    容器数: ${container_count}
    检查间隔: $((POLL_INTERVAL / 60))分钟
 
+🆕 <b>新功能</b>
+   ⚡ 快速检查 - /fastcheck
+   📦 单容器更新 - /update
+
 🤖 <b>交互命令</b>
-   /help - 查看命令列表
-   /check - 手动检查更新
-   /status - 查看状态
+   /help - 查看完整命令列表
+   /fastcheck - 快速并行检查
+   /update - 选择容器更新
 
 ⏰ <b>启动时间</b>
    $(get_time)
@@ -1396,964 +1127,8 @@ docker logs -f --tail 0 watchtower 2>&1 | while IFS= read -r line; do
                 img_name=$(echo "$new_tag_full" | sed 's/:.*$//')
                 time=$(get_time)
 
-                old_tag=$(echo "$old_tag_full" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
-                new_tag=$(echo "$new_tag_full" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
-                old_id_short=$(echo "$old_id_full" | sed 's/sha256://' | head -c 12)
-                new_id_short=$(echo "$new_id_full" | sed 's/sha256://' | head -c 12)
-
-                if [ -n "$old_version_info" ]; then
-                    old_ver_display="v${old_version_info} (${old_id_short})"
-                else
-                    old_ver_display="$old_tag ($old_id_short)"
-                fi
-
-                if [ -n "$new_version_info" ]; then
-                    new_ver_display="v${new_version_info} (${new_id_short})"
-                else
-                    new_ver_display="$new_tag ($new_id_short)"
-                fi
-
-                if [ "$status" = "true" ]; then
-                    message="✨ <b>容器更新成功</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 <b>容器名称</b>
-   <code>${container_name}</code>
-
-🎯 <b>镜像信息</b>
-   <code>${img_name}</code>
-
-🔄 <b>版本变更</b>
-   <code>${old_ver_display}</code>
-   ➜
-   <code>${new_ver_display}</code>
-
-⏰ <b>更新时间</b>
-   <code>${time}</code>
-━━━━━━━━━━━━━━━━━━━━
-
-✅ 容器已成功启动并运行正常"
-
-                    echo "[$(date '+%H:%M:%S')]   → 发送成功通知..."
-                else
-                    message="❌ <b>容器启动失败</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 <b>容器名称</b>
-   <code>${container_name}</code>
-
-🎯 <b>镜像信息</b>
-   <code>${img_name}</code>
-
-🔄 <b>版本变更</b>
-   旧: <code>${old_ver_display}</code>
-   新: <code>${new_ver_display}</code>
-
-⏰ <b>更新时间</b>
-   <code>${time}</code>
-━━━━━━━━━━━━━━━━━━━━
-
-⚠️ 更新后无法启动
-💡 检查: <code>docker logs ${container_name}</code>"
-
-                    echo "[$(date '+%H:%M:%S')]   → 发送失败通知..."
-                fi
-
-                send_telegram "$message"
-
-            done < /tmp/session_data.txt
-
-            rm -f /tmp/session_data.txt
-            echo "[$(date '+%H:%M:%S')] → 所有通知已处理完成"
-
-        elif [ "$updated" -eq 0 ]; then
-            rm -f /tmp/session_data.txt 2>/dev/null
-        fi
-    fi
-
-    if echo "$line" | grep -qiE "level=error.*fatal|level=fatal"; then
-        if echo "$line" | grep -qiE "Skipping|Already up to date|No new images|connection refused.*timeout"; then
-            continue
-        fi
-
-        container_name=$(echo "$line" | sed -n 's/.*container[=: ]\+\([a-zA-Z0-9_.\-]\+\).*/\1/p' | head -n1)
-
-        error=$(echo "$line" | sed -n 's/.*msg="\([^"]*\)".*/\1/p' | head -c 200)
-        [ -z "$error" ] && error=$(echo "$line" | grep -oE "error=.*" | head -c 200)
-        [ -z "$error" ] && error=$(echo "$line" | head -c 200)
-
-        if [ -n "$container_name" ] && [ "$container_name" != "watchtower" ] && [ "$container_name" != "watchtower-notifier" ]; then
-            send_telegram "⚠️ <b>Watchtower 错误</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 <b>容器</b>: <code>$container_name</code>
-🔴 <b>错误</b>: <code>$error</code>
-🕐 <b>时间</b>: <code>$(get_time)</code>
-━━━━━━━━━━━━━━━━━━━━"
-        fi
-    fi
-done
-
-cleanup | sed 's/://' || echo "latest")
-    id_short=$(get_short_id "$img_id")
-
-    if echo "$container_name" | grep -qE "danmu-api|danmu_api"; then
-        real_version=$(get_danmu_version "$container_name")
-        if [ -n "$real_version" ]; then
-            echo "v${real_version} (${id_short})"
-            return
-        fi
-    fi
-
-    echo "${tag} (${id_short})"
-}
-
-save_container_state() {
-    container="$1"
-    image_tag="$2"
-    image_id="$3"
-    version_info="$4"
-
-    if [ ! -f "$STATE_FILE" ]; then
-        touch "$STATE_FILE"
-    fi
-
-    echo "$container|$image_tag|$image_id|$version_info|$(date +%s)" >> "$STATE_FILE"
-}
-
-get_container_state() {
-    container="$1"
-
-    if [ ! -f "$STATE_FILE" ]; then
-        echo "unknown:tag|sha256:unknown|"
-        return
-    fi
-
-    state=$(grep "^${container}|" "$STATE_FILE" 2>/dev/null | tail -n 1)
-    if [ -z "$state" ]; then
-        echo "unknown:tag|sha256:unknown|"
-        return
-    fi
-
-    echo "$state" | cut -d'|' -f2,3,4
-}
-
-cleanup_old_states() {
-    if [ ! -f "$STATE_FILE" ]; then
-        return
-    fi
-
-    cutoff_time=$(( $(date +%s) - 604800 ))
-    temp_file="${STATE_FILE}.tmp"
-
-    : > "$temp_file"
-
-    if [ -s "$STATE_FILE" ]; then
-        while IFS='|' read -r container image_tag image_id version_info timestamp || [ -n "$container" ]; do
-            [ -z "$container" ] && continue
-
-            if echo "$timestamp" | grep -qE '^[0-9]+$' && [ "$timestamp" -ge "$cutoff_time" ]; then
-                echo "$container|$image_tag|$image_id|$version_info|$timestamp" >> "$temp_file"
-            fi
-        done < "$STATE_FILE"
-    fi
-
-    if [ -f "$temp_file" ]; then
-        mv "$temp_file" "$STATE_FILE" 2>/dev/null || rm -f "$temp_file"
-    fi
-}
-
-echo "=========================================="
-echo "Docker 容器监控通知服务 v3.5.1"
-echo "多服务器统一管理版本"
-echo "服务器: ${SERVER_DISPLAY_NAME}"
-echo "服务器ID: ${SERVER_ID}"
-echo "启动时间: $(get_time)"
-echo "=========================================="
-echo ""
-
-load_config
-cleanup_old_states
-
-echo "正在等待 watchtower 容器完全启动..."
-while true; do
-    if docker inspect -f '{{.State.Running}}' watchtower 2>/dev/null | grep -q "true"; then
-        echo "Watchtower 已启动，准备监控日志"
-        break
-    else
-        sleep 2
-    fi
-done
-
-echo "正在初始化容器状态数据库..."
-for container in $(docker ps --format '{{.Names}}'); do
-    if [ "$container" = "watchtower" ] || [ "$container" = "watchtower-notifier" ]; then
-        continue
-    fi
-
-    image_tag=$(docker inspect --format='{{.Config.Image}}' "$container" 2>/dev/null || echo "unknown:tag")
-    image_id=$(docker inspect --format='{{.Image}}' "$container" 2>/dev/null || echo "sha256:unknown")
-
-    version_info=$(get_danmu_version "$container" "false")
-
-    save_container_state "$container" "$image_tag" "$image_id" "$version_info"
-
-    if [ -n "$version_info" ]; then
-        echo "  → 已保存 $container 的状态到数据库 (版本: v${version_info})"
-    else
-        echo "  → 已保存 $container 的状态到数据库"
-    fi
-done
-
-container_count=$(docker ps --format '{{.Names}}' | grep -vE '^watchtower|^watchtower-notifier$' | wc -l)
-echo "初始化完成，已记录 ${container_count} 个容器状态"
-
-register_server
-echo "服务器已注册到注册表，ID: ${SERVER_ID}"
-
-startup_message="🚀 <b>监控服务启动成功</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📊 <b>服务信息</b>
-   版本: v3.5.1
-   服务器: ${SERVER_DISPLAY_NAME}
-   ID: <code>${SERVER_ID}</code>
-
-🎯 <b>监控状态</b>
-   容器数: ${container_count}
-   检查间隔: $((POLL_INTERVAL / 60))分钟
-
-🤖 <b>交互命令</b>
-   /help - 查看命令列表
-   /check - 手动检查更新
-   /status - 查看状态
-
-⏰ <b>启动时间</b>
-   $(get_time)
-━━━━━━━━━━━━━━━━━━━━
-
-✅ 服务正常运行中"
-
-send_telegram "$startup_message"
-
-heartbeat_task &
-HEARTBEAT_PID=$!
-
-command_listener &
-LISTENER_PID=$!
-
-echo "心跳任务已启动 (PID: $HEARTBEAT_PID)"
-echo "命令监听器已启动 (PID: $LISTENER_PID)"
-echo "开始监控 Watchtower 日志..."
-
-cleanup() {
-    echo "收到退出信号，正在清理..."
-
-    if [ -f "$SERVER_REGISTRY_FILE" ]; then
-        temp_registry="/tmp/servers_cleanup.json"
-        cat "$SERVER_REGISTRY_FILE" | jq --arg sid "$SERVER_ID" \
-            'if .servers[$sid] then .servers[$sid].status = "offline" else . end' \
-            > "$temp_registry" 2>/dev/null
-        mv "$temp_registry" "$SERVER_REGISTRY_FILE" 2>/dev/null
-    fi
-
-    kill $LISTENER_PID 2>/dev/null
-    kill $HEARTBEAT_PID 2>/dev/null
-    rm -f /tmp/session_data.txt
-
-    echo "清理完成，服务已停止"
-    exit 0
-}
-
-trap cleanup INT TERM
-
-# 主循环 - 监控 Watchtower 日志
-docker logs -f --tail 0 watchtower 2>&1 | while IFS= read -r line; do
-    echo "[$(date '+%H:%M:%S')] $line"
-
-    if echo "$line" | grep -q "Stopping /"; then
-        container_name=$(echo "$line" | sed -n 's/.*Stopping \/\([^ ]*\).*/\1/p' | head -n1)
-        if [ -n "$container_name" ]; then
-            echo "[$(date '+%H:%M:%S')] → 捕获到停止: $container_name"
-
-            old_state=$(get_container_state "$container_name")
-            old_image_tag=$(echo "$old_state" | cut -d'|' -f1)
-            old_image_id=$(echo "$old_state" | cut -d'|' -f2)
-            old_version_info=$(echo "$old_state" | cut -d'|' -f3)
-
-            echo "${container_name}|${old_image_tag}|${old_image_id}|${old_version_info}" >> /tmp/session_data.txt
-
-            if [ -n "$old_version_info" ]; then
-                echo "[$(date '+%H:%M:%S')]   → 已暂存旧信息: $old_image_tag ($old_image_id) v${old_version_info}"
-            else
-                echo "[$(date '+%H:%M:%S')]   → 已暂存旧信息: $old_image_tag ($old_image_id)"
-            fi
-        fi
-    fi
-
-    if echo "$line" | grep -q "Session done"; then
-        updated=$(echo "$line" | grep -oP '(?<=Updated=)[0-9]+' || echo "0")
-
-        echo "[$(date '+%H:%M:%S')] → Session 完成: Updated=$updated"
-
-        if [ "$updated" -gt 0 ] && [ -f /tmp/session_data.txt ]; then
-            echo "[$(date '+%H:%M:%S')] → 发现 ${updated} 处更新，立即处理..."
-
-            while IFS='|' read -r container_name old_tag_full old_id_full old_version_info; do
-                [ -z "$container_name" ] && continue
-
-                echo "[$(date '+%H:%M:%S')] → 处理容器: $container_name"
-                sleep 5
-
-                for i in $(seq 1 60); do
-                    status=$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || echo "false")
-                    if [ "$status" = "true" ]; then
-                        echo "[$(date '+%H:%M:%S')]   → 容器已启动"
-                        sleep 5
-                        break
-                    fi
-                    sleep 1
-                done
-
-                status=$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || echo "false")
-                new_tag_full=$(docker inspect --format='{{.Config.Image}}' "$container_name" 2>/dev/null || echo "unknown:tag")
-                new_id_full=$(docker inspect --format='{{.Image}}' "$container_name" 2>/dev/null || echo "sha256:unknown")
-
-                new_version_info=""
-                if echo "$container_name" | grep -qE "danmu-api|danmu_api"; then
-                    if [ "$status" = "true" ]; then
-                        new_version_info=$(get_danmu_version "$container_name" "true")
-                    fi
-                fi
-
-                save_container_state "$container_name" "$new_tag_full" "$new_id_full" "$new_version_info"
-
-                img_name=$(echo "$new_tag_full" | sed 's/:.*$//')
-                time=$(get_time)
-
-                old_tag=$(echo "$old_tag_full" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
-                new_tag=$(echo "$new_tag_full" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
-                old_id_short=$(echo "$old_id_full" | sed 's/sha256://' | head -c 12)
-                new_id_short=$(echo "$new_id_full" | sed 's/sha256://' | head -c 12)
-
-                if [ -n "$old_version_info" ]; then
-                    old_ver_display="v${old_version_info} (${old_id_short})"
-                else
-                    old_ver_display="$old_tag ($old_id_short)"
-                fi
-
-                if [ -n "$new_version_info" ]; then
-                    new_ver_display="v${new_version_info} (${new_id_short})"
-                else
-                    new_ver_display="$new_tag ($new_id_short)"
-                fi
-
-                if [ "$status" = "true" ]; then
-                    message="✨ <b>容器更新成功</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 <b>容器名称</b>
-   <code>${container_name}</code>
-
-🎯 <b>镜像信息</b>
-   <code>${img_name}</code>
-
-🔄 <b>版本变更</b>
-   <code>${old_ver_display}</code>
-   ➜
-   <code>${new_ver_display}</code>
-
-⏰ <b>更新时间</b>
-   <code>${time}</code>
-━━━━━━━━━━━━━━━━━━━━
-
-✅ 容器已成功启动并运行正常"
-
-                    echo "[$(date '+%H:%M:%S')]   → 发送成功通知..."
-                else
-                    message="❌ <b>容器启动失败</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 <b>容器名称</b>
-   <code>${container_name}</code>
-
-🎯 <b>镜像信息</b>
-   <code>${img_name}</code>
-
-🔄 <b>版本变更</b>
-   旧: <code>${old_ver_display}</code>
-   新: <code>${new_ver_display}</code>
-
-⏰ <b>更新时间</b>
-   <code>${time}</code>
-━━━━━━━━━━━━━━━━━━━━
-
-⚠️ 更新后无法启动
-💡 检查: <code>docker logs ${container_name}</code>"
-
-                    echo "[$(date '+%H:%M:%S')]   → 发送失败通知..."
-                fi
-
-                send_telegram "$message"
-
-            done < /tmp/session_data.txt
-
-            rm -f /tmp/session_data.txt
-            echo "[$(date '+%H:%M:%S')] → 所有通知已处理完成"
-
-        elif [ "$updated" -eq 0 ]; then
-            rm -f /tmp/session_data.txt 2>/dev/null
-        fi
-    fi
-
-    if echo "$line" | grep -qiE "level=error.*fatal|level=fatal"; then
-        if echo "$line" | grep -qiE "Skipping|Already up to date|No new images|connection refused.*timeout"; then
-            continue
-        fi
-
-        container_name=$(echo "$line" | sed -n 's/.*container[=: ]\+\([a-zA-Z0-9_.\-]\+\).*/\1/p' | head -n1)
-
-        error=$(echo "$line" | sed -n 's/.*msg="\([^"]*\)".*/\1/p' | head -c 200)
-        [ -z "$error" ] && error=$(echo "$line" | grep -oE "error=.*" | head -c 200)
-        [ -z "$error" ] && error=$(echo "$line" | head -c 200)
-
-        if [ -n "$container_name" ] && [ "$container_name" != "watchtower" ] && [ "$container_name" != "watchtower-notifier" ]; then
-            send_telegram "⚠️ <b>Watchtower 错误</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 <b>容器</b>: <code>$container_name</code>
-🔴 <b>错误</b>: <code>$error</code>
-🕐 <b>时间</b>: <code>$(get_time)</code>
-━━━━━━━━━━━━━━━━━━━━"
-        fi
-    fi
-done
-
-cleanup; then
-        send_telegram "❌ Watchtower 容器未运行
-
-请先启动 Watchtower 服务" "$msg_id"
-        return
-    fi
-    
-    echo "[$(date '+%H:%M:%S')] 触发 Watchtower 手动检查..."
-    
-    # 给 watchtower 发送 USR1 信号触发立即检查
-    if docker kill -s SIGUSR1 watchtower 2>/dev/null; then
-        send_telegram "✅ 已触发更新检查
-
-Watchtower 正在检查所有容器
-如有更新会自动推送通知
-
-💡 提示：检查需要 1-3 分钟
-具体时间取决于容器数量和网络速度" "$msg_id"
-        echo "[$(date '+%H:%M:%S')] ✓ 已发送 SIGUSR1 信号"
-    else
-        send_telegram "❌ 触发检查失败
-
-Watchtower 可能未响应
-请尝试重启服务" "$msg_id"
-        echo "[$(date '+%H:%M:%S')] ✗ 发送信号失败"
-    fi
-}
-
-# 执行 list 命令
-execute_list_command() {
-    msg_id="$1"
-    containers=$(docker ps --format '{{.Names}}|||{{.Image}}|||{{.Status}}' | grep -vE '^watchtower' | head -20)
-
-    if [ -z "$containers" ]; then
-        send_telegram "📦 当前没有运行中的容器" "$msg_id"
-        return
-    fi
-
-    containers_msg="📦 <b>运行中的容器</b>
-
-━━━━━━━━━━━━━━━━━━━━"
-
-    echo "$containers" | while IFS='|||' read -r name image status; do
-        short_image=$(echo "$image" | sed 's/:latest$//' | head -c 30)
-        containers_msg="$containers_msg
-🔹 <b>$name</b>
-   <code>$short_image</code>
-"
-    done
-
-    count=$(echo "$containers" | wc -l)
-    containers_msg="$containers_msg
-━━━━━━━━━━━━━━━━━━━━
-共 <b>$count</b> 个容器"
-
-    send_telegram "$containers_msg" "$msg_id"
-}
-
-# 执行 servers 命令
-execute_servers_command() {
-    msg_id="$1"
-    servers=$(get_online_servers)
-    server_count=$(echo "$servers" | jq 'length')
-
-    if [ "$server_count" -eq 0 ]; then
-        send_telegram "📡 当前没有在线服务器" "$msg_id"
-        return
-    fi
-
-    servers_msg="🌐 <b>在线服务器</b>
-
-━━━━━━━━━━━━━━━━━━━━"
-
-    echo "$servers" | jq -r '.[] | "\(.name)|\(.id)|\(.container_count)"' | while IFS='|' read -r name sid count; do
-        indicator=""
-        if [ "$sid" = "$SERVER_ID" ]; then
-            indicator=" 👈"
-        fi
-        servers_msg="$servers_msg
-🖥️ <b>$name</b>$indicator
-   <code>$sid</code> | $count 个容器
-"
-    done
-
-    servers_msg="$servers_msg
-━━━━━━━━━━━━━━━━━━━━
-共 $server_count 台在线"
-
-    send_telegram "$servers_msg" "$msg_id"
-}
-
-# 执行 monitor 命令
-execute_monitor_command() {
-    msg_id="$1"
-    containers="$2"
-
-    load_config
-
-    if [ -z "$containers" ]; then
-        # 显示当前监控列表
-        if [ -n "$MONITORED_CONTAINERS" ]; then
-            send_telegram "📦 <b>当前监控列表</b>
-
-$MONITORED_CONTAINERS
-
-💡 修改: /monitor 容器名
-💡 清空: /monitor all" "$msg_id"
-        else
-            send_telegram "📦 当前监控所有容器
-
-💡 指定监控: /monitor 容器名
-   例如: /monitor nginx mysql" "$msg_id"
-        fi
-        return
-    fi
-
-    if [ "$containers" = "all" ]; then
-        MONITORED_CONTAINERS=""
-        save_config
-        send_telegram "✅ 已设置为监控所有容器" "$msg_id"
-    else
-        MONITORED_CONTAINERS="$containers"
-        save_config
-        send_telegram "✅ 监控列表已更新
-
-监控: <code>$containers</code>" "$msg_id"
-    fi
-}
-
-# 处理命令
-process_command() {
-    cmd="$1"
-    msg_id="$2"
-    user_id="$3"
-
-    if [ "$user_id" != "$CHAT_ID" ]; then
-        send_telegram "⛔ 无权限" "$msg_id"
-        return
-    fi
-
-    case "$cmd" in
-        /start|/help)
-            help_msg="🤖 <b>Docker 监控 Bot v3.5.1</b>
-
-━━━━━━━━━━━━━━━━━━━━
-<b>🔍 查询命令</b>
-
-/status - 查看服务状态
-/list - 查看运行中的容器
-/servers - 查看所有在线服务器
-
-<b>🔄 操作命令</b>
-
-/check - 立即检查更新
-/monitor - 查看/设置监控列表
-/monitor all - 监控所有容器
-/monitor 容器名 - 监控指定容器
-
-━━━━━━━━━━━━━━━━━━━━
-<b>💡 多服务器管理</b>
-
-有多个服务器时，命令会显示
-服务器选择按钮
-
-<b>当前服务器:</b> ${SERVER_DISPLAY_NAME}
-<b>服务器ID:</b> <code>${SERVER_ID}</code>"
-            send_telegram "$help_msg" "$msg_id"
-            ;;
-
-        /servers)
-            execute_servers_command "$msg_id"
-            ;;
-
-        /status|/check|/list)
-            servers=$(get_online_servers)
-            server_count=$(echo "$servers" | jq 'length')
-
-            if [ "$server_count" -le 1 ]; then
-                case "$cmd" in
-                    /status) execute_status_command "$msg_id" ;;
-                    /check) execute_check_command "$msg_id" ;;
-                    /list) execute_list_command "$msg_id" ;;
-                esac
-            else
-                keyboard=$(generate_server_keyboard "$cmd")
-                cmd_name=$(echo "$cmd" | sed 's|/||')
-                send_telegram_with_keyboard "🌐 请选择服务器执行 <b>${cmd_name}</b>:" "$keyboard"
-            fi
-            ;;
-
-        /monitor*)
-            containers=$(echo "$cmd" | sed 's/\/monitor\s*//')
-            execute_monitor_command "$msg_id" "$containers"
-            ;;
-
-        *)
-            send_telegram "❌ 未知命令
-
-发送 /help 查看命令列表" "$msg_id"
-            ;;
-    esac
-}
-
-# 心跳任务
-heartbeat_task() {
-    while true; do
-        register_server
-        sleep 30
-    done
-}
-
-# 命令监听后台任务
-command_listener() {
-    echo "启动命令监听器..."
-
-    while true; do
-        updates=$(get_updates)
-
-        if [ -n "$updates" ] && echo "$updates" | grep -q '"ok":true'; then
-            echo "$updates" | jq -r '.result[] | @base64' 2>/dev/null | while read -r update; do
-                decoded=$(echo "$update" | base64 -d 2>/dev/null)
-
-                update_id=$(echo "$decoded" | jq -r '.update_id // empty' 2>/dev/null)
-
-                # 处理普通消息
-                message=$(echo "$decoded" | jq -r '.message.text // empty' 2>/dev/null)
-                msg_id=$(echo "$decoded" | jq -r '.message.message_id // empty' 2>/dev/null)
-                user_id=$(echo "$decoded" | jq -r '.message.from.id // empty' 2>/dev/null)
-
-                # 处理回调查询
-                callback_query=$(echo "$decoded" | jq -r '.callback_query // empty' 2>/dev/null)
-
-                if [ -n "$update_id" ]; then
-                    echo "$update_id" > "$LAST_UPDATE_ID_FILE"
-                fi
-
-                if [ -n "$message" ] && echo "$message" | grep -q '^/'; then
-                    echo "[$(date '+%H:%M:%S')] 收到命令: $message (来自: $user_id)"
-                    process_command "$message" "$msg_id" "$user_id"
-                elif [ "$callback_query" != "null" ] && [ -n "$callback_query" ]; then
-                    callback_id=$(echo "$decoded" | jq -r '.callback_query.id' 2>/dev/null)
-                    callback_data=$(echo "$decoded" | jq -r '.callback_query.data' 2>/dev/null)
-                    from_user=$(echo "$decoded" | jq -r '.callback_query.from.id' 2>/dev/null)
-
-                    echo "[$(date '+%H:%M:%S')] 收到回调: $callback_data"
-                    process_callback "$callback_id" "$callback_data" "$from_user"
-                fi
-            done
-        fi
-
-        sleep 2
-    done
-}
-
-# 获取 danmu 版本
-get_danmu_version() {
-    container_name="$1"
-    check_running="${2:-true}"
-
-    if ! echo "$container_name" | grep -qE "danmu-api|danmu_api"; then
-        echo ""
-        return
-    fi
-
-    version=""
-
-    if [ "$check_running" = "true" ]; then
-        for i in $(seq 1 30); do
-            if docker exec "$container_name" test -f /app/danmu_api/configs/globals.js 2>/dev/null; then
-                break
-            fi
-            sleep 1
-        done
-    fi
-
-    version=$(docker exec "$container_name" cat /app/danmu_api/configs/globals.js 2>/dev/null | \
-              grep -m 1 "VERSION:" | sed -E "s/.*VERSION: '([^']+)'.*/\1/" 2>/dev/null || echo "")
-
-    echo "$version"
-}
-
-format_version() {
-    img_tag="$1"
-    img_id="$2"
-    container_name="$3"
-
-    tag=$(echo "$img_tag" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
-    id_short=$(get_short_id "$img_id")
-
-    if echo "$container_name" | grep -qE "danmu-api|danmu_api"; then
-        real_version=$(get_danmu_version "$container_name")
-        if [ -n "$real_version" ]; then
-            echo "v${real_version} (${id_short})"
-            return
-        fi
-    fi
-
-    echo "$tag ($id_short)"
-}
-
-save_container_state() {
-    container="$1"
-    image_tag="$2"
-    image_id="$3"
-    version_info="$4"
-
-    if [ ! -f "$STATE_FILE" ]; then
-        touch "$STATE_FILE"
-    fi
-
-    echo "$container|$image_tag|$image_id|$version_info|$(date +%s)" >> "$STATE_FILE"
-}
-
-get_container_state() {
-    container="$1"
-
-    if [ ! -f "$STATE_FILE" ]; then
-        echo "unknown:tag|sha256:unknown|"
-        return
-    fi
-
-    state=$(grep "^${container}|" "$STATE_FILE" 2>/dev/null | tail -n 1)
-    if [ -z "$state" ]; then
-        echo "unknown:tag|sha256:unknown|"
-        return
-    fi
-
-    echo "$state" | cut -d'|' -f2,3,4
-}
-
-cleanup_old_states() {
-    if [ ! -f "$STATE_FILE" ]; then
-        return
-    fi
-
-    cutoff_time=$(( $(date +%s) - 604800 ))
-    temp_file="${STATE_FILE}.tmp"
-
-    : > "$temp_file"
-
-    if [ -s "$STATE_FILE" ]; then
-        while IFS='|' read -r container image_tag image_id version_info timestamp || [ -n "$container" ]; do
-            [ -z "$container" ] && continue
-
-            if echo "$timestamp" | grep -qE '^[0-9]+$' && [ "$timestamp" -ge "$cutoff_time" ]; then
-                echo "$container|$image_tag|$image_id|$version_info|$timestamp" >> "$temp_file"
-            fi
-        done < "$STATE_FILE"
-    fi
-
-    if [ -f "$temp_file" ]; then
-        mv "$temp_file" "$STATE_FILE" 2>/dev/null || rm -f "$temp_file"
-    fi
-}
-
-echo "=========================================="
-echo "Docker 容器监控通知服务 v3.5.1"
-echo "多服务器统一管理版本"
-echo "服务器: ${SERVER_DISPLAY_NAME}"
-echo "服务器ID: ${SERVER_ID}"
-echo "启动时间: $(get_time)"
-echo "=========================================="
-echo ""
-
-load_config
-cleanup_old_states
-
-echo "正在等待 watchtower 容器完全启动..."
-while true; do
-    if docker inspect -f '{{.State.Running}}' watchtower 2>/dev/null | grep -q "true"; then
-        echo "Watchtower 已启动，准备监控日志"
-        break
-    else
-        sleep 2
-    fi
-done
-
-echo "正在初始化容器状态数据库..."
-for container in $(docker ps --format '{{.Names}}'); do
-    if [ "$container" = "watchtower" ] || [ "$container" = "watchtower-notifier" ]; then
-        continue
-    fi
-
-    image_tag=$(docker inspect --format='{{.Config.Image}}' "$container" 2>/dev/null || echo "unknown:tag")
-    image_id=$(docker inspect --format='{{.Image}}' "$container" 2>/dev/null || echo "sha256:unknown")
-
-    version_info=$(get_danmu_version "$container" "false")
-
-    save_container_state "$container" "$image_tag" "$image_id" "$version_info"
-
-    if [ -n "$version_info" ]; then
-        echo "  → 已保存 $container 的状态到数据库 (版本: v${version_info})"
-    else
-        echo "  → 已保存 $container 的状态到数据库"
-    fi
-done
-
-container_count=$(docker ps --format '{{.Names}}' | grep -vE '^watchtower|^watchtower-notifier$' | wc -l)
-echo "初始化完成，已记录 ${container_count} 个容器状态"
-
-register_server
-echo "服务器已注册到注册表，ID: ${SERVER_ID}"
-
-startup_message="🚀 <b>监控服务启动成功</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📊 <b>服务信息</b>
-   版本: v3.5.1
-   服务器: ${SERVER_DISPLAY_NAME}
-   ID: <code>${SERVER_ID}</code>
-
-🎯 <b>监控状态</b>
-   容器数: ${container_count}
-   检查间隔: $((POLL_INTERVAL / 60))分钟
-
-🤖 <b>交互命令</b>
-   /help - 查看命令列表
-   /check - 手动检查更新
-   /status - 查看状态
-
-⏰ <b>启动时间</b>
-   $(get_time)
-━━━━━━━━━━━━━━━━━━━━
-
-✅ 服务正常运行中"
-
-send_telegram "$startup_message"
-
-heartbeat_task &
-HEARTBEAT_PID=$!
-
-command_listener &
-LISTENER_PID=$!
-
-echo "心跳任务已启动 (PID: $HEARTBEAT_PID)"
-echo "命令监听器已启动 (PID: $LISTENER_PID)"
-echo "开始监控 Watchtower 日志..."
-
-cleanup() {
-    echo "收到退出信号，正在清理..."
-
-    if [ -f "$SERVER_REGISTRY_FILE" ]; then
-        temp_registry="/tmp/servers_cleanup.json"
-        cat "$SERVER_REGISTRY_FILE" | jq --arg sid "$SERVER_ID" \
-            'if .servers[$sid] then .servers[$sid].status = "offline" else . end' \
-            > "$temp_registry" 2>/dev/null
-        mv "$temp_registry" "$SERVER_REGISTRY_FILE" 2>/dev/null
-    fi
-
-    kill $LISTENER_PID 2>/dev/null
-    kill $HEARTBEAT_PID 2>/dev/null
-    rm -f /tmp/session_data.txt
-
-    echo "清理完成，服务已停止"
-    exit 0
-}
-
-trap cleanup INT TERM
-
-# 主循环 - 监控 Watchtower 日志
-docker logs -f --tail 0 watchtower 2>&1 | while IFS= read -r line; do
-    echo "[$(date '+%H:%M:%S')] $line"
-
-    if echo "$line" | grep -q "Stopping /"; then
-        container_name=$(echo "$line" | sed -n 's/.*Stopping \/\([^ ]*\).*/\1/p' | head -n1)
-        if [ -n "$container_name" ]; then
-            echo "[$(date '+%H:%M:%S')] → 捕获到停止: $container_name"
-
-            old_state=$(get_container_state "$container_name")
-            old_image_tag=$(echo "$old_state" | cut -d'|' -f1)
-            old_image_id=$(echo "$old_state" | cut -d'|' -f2)
-            old_version_info=$(echo "$old_state" | cut -d'|' -f3)
-
-            echo "${container_name}|${old_image_tag}|${old_image_id}|${old_version_info}" >> /tmp/session_data.txt
-
-            if [ -n "$old_version_info" ]; then
-                echo "[$(date '+%H:%M:%S')]   → 已暂存旧信息: $old_image_tag ($old_image_id) v${old_version_info}"
-            else
-                echo "[$(date '+%H:%M:%S')]   → 已暂存旧信息: $old_image_tag ($old_image_id)"
-            fi
-        fi
-    fi
-
-    if echo "$line" | grep -q "Session done"; then
-        updated=$(echo "$line" | grep -oP '(?<=Updated=)[0-9]+' || echo "0")
-
-        echo "[$(date '+%H:%M:%S')] → Session 完成: Updated=$updated"
-
-        if [ "$updated" -gt 0 ] && [ -f /tmp/session_data.txt ]; then
-            echo "[$(date '+%H:%M:%S')] → 发现 ${updated} 处更新，立即处理..."
-
-            while IFS='|' read -r container_name old_tag_full old_id_full old_version_info; do
-                [ -z "$container_name" ] && continue
-
-                echo "[$(date '+%H:%M:%S')] → 处理容器: $container_name"
-                sleep 5
-
-                for i in $(seq 1 60); do
-                    status=$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || echo "false")
-                    if [ "$status" = "true" ]; then
-                        echo "[$(date '+%H:%M:%S')]   → 容器已启动"
-                        sleep 5
-                        break
-                    fi
-                    sleep 1
-                done
-
-                status=$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || echo "false")
-                new_tag_full=$(docker inspect --format='{{.Config.Image}}' "$container_name" 2>/dev/null || echo "unknown:tag")
-                new_id_full=$(docker inspect --format='{{.Image}}' "$container_name" 2>/dev/null || echo "sha256:unknown")
-
-                new_version_info=""
-                if echo "$container_name" | grep -qE "danmu-api|danmu_api"; then
-                    if [ "$status" = "true" ]; then
-                        new_version_info=$(get_danmu_version "$container_name" "true")
-                    fi
-                fi
-
-                save_container_state "$container_name" "$new_tag_full" "$new_id_full" "$new_version_info"
-
-                img_name=$(echo "$new_tag_full" | sed 's/:.*$//')
-                time=$(get_time)
-
-                old_tag=$(echo "$old_tag_full" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
-                new_tag=$(echo "$new_tag_full" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
+                old_tag=$(echo "$old_tag_full" | grep -oE ':[^:]+ | sed 's/://' || echo "latest")
+                new_tag=$(echo "$new_tag_full" | grep -oE ':[^:]+ | sed 's/://' || echo "latest")
                 old_id_short=$(echo "$old_id_full" | sed 's/sha256://' | head -c 12)
                 new_id_short=$(echo "$new_id_full" | sed 's/sha256://' | head -c 12)
 
