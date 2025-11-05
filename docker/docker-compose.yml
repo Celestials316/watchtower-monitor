@@ -49,8 +49,7 @@ services:
         condition: service_started
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./data:/data
-      # ⚠️ v3.4.0 不需要挂载 monitor.sh，已打包在镜像中
+      - monitor-data:/data
     environment:
       - TZ=Asia/Shanghai
       # ============================================
@@ -67,19 +66,19 @@ services:
       
       # 检查间隔（秒）
       # 1800 = 30分钟, 3600 = 1小时, 21600 = 6小时
-      - POLL_INTERVAL=${POLL_INTERVAL:-3600}
+      - POLL_INTERVAL=3600
       
       # 是否自动清理旧镜像 (true/false)
-      - CLEANUP=${CLEANUP:-true}
+      - CLEANUP=true
       
       # 是否启用自动回滚 (true/false)
-      - ENABLE_ROLLBACK=${ENABLE_ROLLBACK:-true}
+      - ENABLE_ROLLBACK=true
       
       # 监控的容器列表（留空表示监控所有）
-      - MONITORED_CONTAINERS=${MONITORED_CONTAINERS:-}
+      - MONITORED_CONTAINERS=
       
       # ============================================
-      # 代理配置（国内服务器必需）
+      # 代理配置（国内服务器可选）
       # ============================================
       # 如果在中国大陆，需要配置代理访问 Telegram
       # 取消下面的注释并替换为实际代理地址
@@ -100,3 +99,7 @@ services:
       start_period: 15s
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
+
+# 命名卷用于多服务器共享数据
+volumes:
+  monitor-data:
