@@ -944,8 +944,10 @@ cleanup_old_states() {
         while IFS='|' read -r container image_tag image_id version_info timestamp || [ -n "$container" ]; do
             [ -z "$container" ] && continue
 
-            if echo "$timestamp" | grep -qE '^[0-9]+ && [ "$timestamp" -ge "$cutoff_time" ]; then
-                echo "$container|$image_tag|$image_id|$version_info|$timestamp" >> "$temp_file"
+            if echo "$timestamp" | grep -qE '^[0-9]+; then
+                if [ "$timestamp" -ge "$cutoff_time" ]; then
+                    echo "$container|$image_tag|$image_id|$version_info|$timestamp" >> "$temp_file"
+                fi
             fi
         done < "$STATE_FILE"
     fi
