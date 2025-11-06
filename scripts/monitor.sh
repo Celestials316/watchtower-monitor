@@ -464,28 +464,6 @@ handle_monitor_command() {
     send_telegram "📡 <b>监控管理</b>\n\n请选择操作：" "$buttons"
 }
 
-handle_runonce_command() {
-    chat_id="$1"
-    
-    send_telegram "🔄 <b>手动更新检查</b>
-
-━━━━━━━━━━━━━━━━━━━━
-正在触发 Watchtower 执行一次性更新检查...
-
-⏳ 请稍候，这可能需要几分钟时间
-━━━━━━━━━━━━━━━━━━━━"
-    
-    # 发送 SIGUSR1 信号给 watchtower 容器触发立即检查
-    if docker kill --signal=SIGUSR1 watchtower >/dev/null 2>&1; then
-        sleep 2
-        send_telegram "✅ 已触发更新检查，Watchtower 正在处理中
-
-如有更新将自动通知"
-    else
-        send_telegram "❌ 触发失败，请检查 Watchtower 容器状态"
-    fi
-}
-
 handle_help_command() {
     help_msg="📖 <b>命令帮助</b>
 
@@ -500,9 +478,6 @@ handle_help_command() {
 
 /restart [容器名]
   重启容器（不指定则显示选择列表）
-
-/runonce
-  立即触发一次 Watchtower 更新检查
 
 /monitor
   监控管理（添加/移除监控容器）
@@ -754,7 +729,6 @@ bot_handler() {
                     /status) handle_status_command "$chat_id" ;;
                     /update) handle_update_command "$chat_id" "$message_id" "$param" ;;
                     /restart) handle_restart_command "$chat_id" "$message_id" "$param" ;;
-                    /runonce) handle_runonce_command "$chat_id" ;;
                     /monitor) handle_monitor_command "$chat_id" ;;
                     /help) handle_help_command ;;
                     /start) handle_help_command ;;
@@ -883,7 +857,6 @@ ${monitor_list}
    /status - 查看状态
    /update [容器名] - 更新容器
    /restart [容器名] - 重启容器
-   /runonce - 立即检查更新
    /monitor - 监控管理
    /help - 显示帮助
 
