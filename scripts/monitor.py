@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Docker 容器监控通知服务 v5.2.2
-修复回调处理需要点击两次的问题
+Docker 容器监控通知服务 v5.3.0
+- 添加主服务器优先协调机制
+- 实现单容器更新功能
+- 优化启动响应速度
 """
 
 import os
@@ -21,10 +23,11 @@ from pathlib import Path
 
 # ==================== 配置和常量 ====================
 
-VERSION = "5.2.2"
+VERSION = "5.3.0"
 TELEGRAM_API = f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN')}"
 CHAT_ID = os.getenv('CHAT_ID')
 SERVER_NAME = os.getenv('SERVER_NAME')
+PRIMARY_SERVER = os.getenv('PRIMARY_SERVER', SERVER_NAME)  # 主服务器，默认为当前服务器
 
 # 文件路径
 DATA_DIR = Path("/data")
@@ -88,40 +91,31 @@ def safe_read_json(file_path: Path, default: Dict = None, max_retries: int = 3) 
     for attempt in range(max_retries):
         try:
             if not file_path.exists():
-                logger.debug(f"文件不存在，返回默认值: {file_path}")
                 return default.copy()
 
-            # 使用文件锁
             with FileLock(file_path, timeout=5):
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read().strip()
-
-                    # 检查文件是否为空
                     if not content:
-                        logger.warning(f"文件为空: {file_path}")
                         return default.copy()
-
-                    # 尝试解析 JSON
                     data = json.loads(content)
                     return data
 
         except json.JSONDecodeError as e:
-            logger.error(f"JSON 解析失败 (尝试 {attempt + 1}/{max_retries}): {file_path} - {e}")
+            logger.error(f"JSON 解析失败 (尝试 {attempt + 1}/{max_retries}): {file_path}")
             if attempt < max_retries - 1:
                 time.sleep(0.5)
             else:
-                logger.error(f"JSON 文件损坏，返回默认值: {file_path}")
                 return default.copy()
 
-        except TimeoutError as e:
-            logger.error(f"获取文件锁超时 (尝试 {attempt + 1}/{max_retries}): {e}")
+        except TimeoutError:
             if attempt < max_retries - 1:
                 time.sleep(1)
             else:
                 return default.copy()
 
         except Exception as e:
-            logger.error(f"读取文件失败 (尝试 {attempt + 1}/{max_retries}): {file_path} - {e}")
+            logger.error(f"读取文件失败: {e}")
             if attempt < max_retries - 1:
                 time.sleep(0.5)
             else:
@@ -134,26 +128,21 @@ def safe_write_json(file_path: Path, data: Dict, max_retries: int = 3) -> bool:
     """安全写入 JSON 文件（带重试和文件锁）"""
     for attempt in range(max_retries):
         try:
-            # 使用文件锁
             with FileLock(file_path, timeout=5):
-                # 先写入临时文件
                 temp_path = file_path.with_suffix('.tmp')
                 with open(temp_path, 'w', encoding='utf-8') as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                     f.flush()
-                    os.fsync(f.fileno())  # 强制写入磁盘
-
-                # 原子性替换
+                    os.fsync(f.fileno())
                 temp_path.replace(file_path)
                 return True
 
-        except TimeoutError as e:
-            logger.error(f"获取文件锁超时 (尝试 {attempt + 1}/{max_retries}): {e}")
+        except TimeoutError:
             if attempt < max_retries - 1:
                 time.sleep(1)
 
         except Exception as e:
-            logger.error(f"写入文件失败 (尝试 {attempt + 1}/{max_retries}): {file_path} - {e}")
+            logger.error(f"写入文件失败: {e}")
             if attempt < max_retries - 1:
                 time.sleep(0.5)
 
@@ -163,20 +152,21 @@ def safe_write_json(file_path: Path, data: Dict, max_retries: int = 3) -> bool:
 # ==================== 工具类 ====================
 
 class CommandCoordinator:
-    """命令协调器 - 防止多服务器重复响应"""
+    """命令协调器 - 主服务器优先机制"""
 
-    def __init__(self, server_name: str, registry_file: Path):
+    def __init__(self, server_name: str, primary_server: str, registry_file: Path):
         self.server_name = server_name
+        self.primary_server = primary_server
         self.registry_file = registry_file
+        self.is_primary = (server_name == primary_server)
 
     def should_handle_command(self, command: str, callback_data: str = None) -> bool:
         """判断当前服务器是否应该处理该命令或回调"""
 
-        # 如果是回调数据，检查是否包含服务器标识
         if callback_data:
             return self._should_handle_callback(callback_data)
 
-        # 不需要协调的命令（全局命令，需要所有服务器响应）
+        # 全局命令（所有服务器响应）
         global_commands = ['/start']
         if any(command.startswith(cmd) for cmd in global_commands):
             return True
@@ -186,17 +176,8 @@ class CommandCoordinator:
         if not any(command.startswith(cmd) for cmd in coordinated_commands):
             return True
 
-        # 获取活跃服务器列表
-        servers = self._get_active_servers()
-        if not servers:
-            return True
-
-        # 如果只有当前服务器，直接处理
-        if len(servers) == 1 and servers[0] == self.server_name:
-            return True
-
-        # 多服务器情况：选择协调者（按字母顺序第一个）
-        coordinator = sorted(servers)[0]
+        # 获取协调者
+        coordinator = self._get_coordinator()
         is_coordinator = (self.server_name == coordinator)
 
         if is_coordinator:
@@ -208,27 +189,23 @@ class CommandCoordinator:
 
     def _should_handle_callback(self, callback_data: str) -> bool:
         """判断是否应该处理回调"""
-        # 解析回调数据
         parts = callback_data.split(':')
         action = parts[0]
 
-        # 不包含服务器信息的回调，需要协调（仅由协调者处理第一步：显示服务器列表）
+        # 不包含服务器信息的回调，由协调者处理
         non_server_callbacks = ['monitor_action', 'cancel']
         if action in non_server_callbacks:
-            servers = self._get_active_servers()
-            if len(servers) <= 1:
-                return True
-            coordinator = sorted(servers)[0]
+            coordinator = self._get_coordinator()
             return self.server_name == coordinator
 
         # 包含服务器信息的回调 - 由目标服务器处理
         if len(parts) >= 2:
-            # 这些回调的第二个参数是目标服务器
             server_target_actions = [
                 'status_srv', 'update_srv', 'restart_srv', 'monitor_srv',
-                'update_cnt', 'restart_cnt', 'confirm_restart', 'add_mon', 'rem_mon'
+                'update_cnt', 'restart_cnt', 'confirm_restart', 
+                'confirm_update', 'add_mon', 'rem_mon'
             ]
-            
+
             if action in server_target_actions:
                 target_server = parts[1]
                 should_handle = (target_server == self.server_name)
@@ -236,11 +213,22 @@ class CommandCoordinator:
                 return should_handle
 
         # 默认：让协调者处理
-        servers = self._get_active_servers()
-        if len(servers) <= 1:
-            return True
-        coordinator = sorted(servers)[0]
+        coordinator = self._get_coordinator()
         return self.server_name == coordinator
+
+    def _get_coordinator(self) -> str:
+        """获取协调者（优先使用主服务器）"""
+        servers = self._get_active_servers()
+        
+        if not servers:
+            return self.server_name
+        
+        # 如果主服务器在线，使用主服务器
+        if self.primary_server in servers:
+            return self.primary_server
+        
+        # 否则使用字母顺序第一个
+        return sorted(servers)[0]
 
     def _get_active_servers(self) -> List[str]:
         """获取活跃的服务器列表"""
@@ -300,10 +288,8 @@ class TelegramBot:
 
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 5
-                logger.info(f"↻ {wait_time}秒后重试 ({attempt + 1}/{max_retries})...")
                 time.sleep(wait_time)
 
-        logger.error(f"✗ Telegram 消息最终失败 (已重试 {max_retries} 次)")
         return False
 
     def edit_message(self, chat_id: str, message_id: str, text: str, 
@@ -415,6 +401,167 @@ class DockerManager:
             return False
 
     @staticmethod
+    def update_container(container: str, progress_callback=None) -> Dict:
+        """
+        更新容器
+        返回: {'success': bool, 'message': str, 'old_version': str, 'new_version': str}
+        """
+        result = {
+            'success': False,
+            'message': '',
+            'old_version': '',
+            'new_version': ''
+        }
+
+        try:
+            # 1. 获取旧版本信息
+            if progress_callback:
+                progress_callback("📋 正在获取容器信息...")
+            
+            old_info = DockerManager.get_container_info(container)
+            if not old_info:
+                result['message'] = "无法获取容器信息"
+                return result
+
+            image = old_info['image']
+            old_image_id = old_info['image_id']
+            result['old_version'] = DockerManager._format_version_info(old_info, container)
+
+            # 2. 拉取新镜像
+            if progress_callback:
+                progress_callback(f"🔄 正在拉取镜像: {image}")
+            
+            logger.info(f"拉取镜像: {image}")
+            pull_result = subprocess.run(
+                ['docker', 'pull', image],
+                capture_output=True, text=True, timeout=300
+            )
+
+            if pull_result.returncode != 0:
+                result['message'] = f"拉取镜像失败: {pull_result.stderr[:200]}"
+                return result
+
+            # 3. 检查是否有更新
+            new_inspect = subprocess.run(
+                ['docker', 'inspect', '--format', '{{.Id}}', image],
+                capture_output=True, text=True, timeout=10
+            )
+            
+            if new_inspect.returncode == 0:
+                new_image_id = new_inspect.stdout.strip()
+                if new_image_id == old_image_id:
+                    result['message'] = "镜像已是最新版本，无需更新"
+                    result['success'] = True
+                    return result
+
+            # 4. 获取容器配置
+            if progress_callback:
+                progress_callback("📦 正在获取容器配置...")
+
+            inspect_result = subprocess.run(
+                ['docker', 'inspect', container],
+                capture_output=True, text=True, timeout=10
+            )
+
+            if inspect_result.returncode != 0:
+                result['message'] = "无法获取容器配置"
+                return result
+
+            config = json.loads(inspect_result.stdout)[0]
+            
+            # 提取运行参数
+            env_vars = config['Config'].get('Env', [])
+            volumes = []
+            for mount in config['Mounts']:
+                volumes.extend(['-v', f"{mount['Source']}:{mount['Destination']}"])
+            
+            ports = []
+            port_bindings = config['HostConfig'].get('PortBindings', {})
+            for container_port, host_configs in port_bindings.items():
+                if host_configs:
+                    host_port = host_configs[0].get('HostPort', '')
+                    if host_port:
+                        ports.extend(['-p', f"{host_port}:{container_port.split('/')[0]}"])
+
+            network = config['HostConfig'].get('NetworkMode', 'bridge')
+            restart_policy = config['HostConfig'].get('RestartPolicy', {}).get('Name', 'unless-stopped')
+
+            # 5. 停止并删除旧容器
+            if progress_callback:
+                progress_callback("⏸️ 正在停止旧容器...")
+
+            logger.info(f"停止容器: {container}")
+            subprocess.run(['docker', 'stop', container], timeout=30)
+
+            if progress_callback:
+                progress_callback("🗑️ 正在删除旧容器...")
+
+            logger.info(f"删除容器: {container}")
+            subprocess.run(['docker', 'rm', container], timeout=10)
+
+            # 6. 创建并启动新容器
+            if progress_callback:
+                progress_callback("🚀 正在启动新容器...")
+
+            logger.info(f"启动新容器: {container}")
+            
+            run_cmd = ['docker', 'run', '-d', '--name', container]
+            run_cmd.extend(['--network', network])
+            run_cmd.extend(['--restart', restart_policy])
+            
+            for env in env_vars:
+                run_cmd.extend(['-e', env])
+            
+            run_cmd.extend(volumes)
+            run_cmd.extend(ports)
+            run_cmd.append(image)
+
+            run_result = subprocess.run(
+                run_cmd,
+                capture_output=True, text=True, timeout=60
+            )
+
+            if run_result.returncode != 0:
+                result['message'] = f"启动新容器失败: {run_result.stderr[:200]}"
+                return result
+
+            # 7. 等待容器启动
+            time.sleep(5)
+
+            # 8. 获取新版本信息
+            new_info = DockerManager.get_container_info(container)
+            if new_info and new_info.get('running'):
+                result['new_version'] = DockerManager._format_version_info(new_info, container)
+                result['success'] = True
+                result['message'] = "容器更新成功"
+            else:
+                result['message'] = "容器启动失败，请检查日志"
+
+            return result
+
+        except subprocess.TimeoutExpired:
+            result['message'] = "操作超时"
+            return result
+        except Exception as e:
+            result['message'] = f"更新失败: {str(e)[:200]}"
+            logger.error(f"更新容器 {container} 失败: {e}")
+            return result
+
+    @staticmethod
+    def _format_version_info(info: Dict, container: str) -> str:
+        """格式化版本信息"""
+        image_id = info.get('image_id', 'unknown')
+        id_short = image_id.replace('sha256:', '')[:12]
+
+        if 'danmu' in container.lower():
+            version = DockerManager.get_danmu_version(container)
+            if version:
+                return f"v{version} ({id_short})"
+
+        tag = info.get('image', 'unknown:latest').split(':')[-1]
+        return f"{tag} ({id_short})"
+
+    @staticmethod
     def get_danmu_version(container: str) -> Optional[str]:
         """获取 danmu-api 版本"""
         if 'danmu' not in container.lower():
@@ -499,9 +646,10 @@ class ConfigManager:
 class ServerRegistry:
     """服务器注册中心"""
 
-    def __init__(self, registry_file: Path, server_name: str):
+    def __init__(self, registry_file: Path, server_name: str, is_primary: bool):
         self.registry_file = registry_file
         self.server_name = server_name
+        self.is_primary = is_primary
         self.heartbeat_interval = 30
         self.timeout = 90
 
@@ -510,10 +658,12 @@ class ServerRegistry:
         registry = safe_read_json(self.registry_file, default={})
         registry[self.server_name] = {
             'last_heartbeat': time.time(),
-            'version': VERSION
+            'version': VERSION,
+            'is_primary': self.is_primary
         }
         if safe_write_json(self.registry_file, registry):
-            logger.info(f"服务器已注册: {self.server_name}")
+            role = "主服务器" if self.is_primary else "从服务器"
+            logger.info(f"服务器已注册: {self.server_name} ({role})")
         else:
             logger.error(f"服务器注册失败: {self.server_name}")
 
@@ -553,7 +703,6 @@ class CommandHandler:
         """处理 /status 命令"""
         servers = self.registry.get_active_servers()
 
-        # 多服务器：显示选择菜单
         if len(servers) > 1:
             buttons = {
                 'inline_keyboard': [
@@ -563,7 +712,6 @@ class CommandHandler:
             }
             self.bot.send_message("📊 <b>选择要查看状态的服务器：</b>", buttons)
         else:
-            # 单服务器：直接显示状态
             self._show_server_status(chat_id, servers[0] if servers else SERVER_NAME)
 
     def _show_server_status(self, chat_id: str, server: str):
@@ -743,11 +891,81 @@ class CommandHandler:
 
         elif action == 'update_cnt':
             server, container = parts[1], parts[2]
-            self.bot.answer_callback(callback_query_id, "正在准备更新...")
-            self.bot.edit_message(
-                chat_id, message_id,
-                f"⚠️ 容器更新功能开发中\n\n服务器: <code>{server}</code>\n容器: <code>{container}</code>"
-            )
+            confirm_msg = f"""⚠️ <b>确认更新</b>
+
+━━━━━━━━━━━━━━━━━━━━
+🖥️ 服务器: <code>{server}</code>
+📦 容器: <code>{container}</code>
+
+<b>更新流程：</b>
+1. 拉取最新镜像
+2. 停止当前容器
+3. 删除旧容器
+4. 启动新容器
+
+⚠️ <b>注意：</b>容器将短暂停止服务
+
+是否继续？
+━━━━━━━━━━━━━━━━━━━━"""
+
+            buttons = {
+                'inline_keyboard': [
+                    [{'text': "✅ 确认更新", 
+                      'callback_data': f"confirm_update:{server}:{container}"}],
+                    [{'text': "❌ 取消", 'callback_data': "cancel"}]
+                ]
+            }
+            self.bot.answer_callback(callback_query_id, "准备更新...")
+            self.bot.edit_message(chat_id, message_id, confirm_msg, buttons)
+
+        elif action == 'confirm_update':
+            server, container = parts[1], parts[2]
+            self.bot.answer_callback(callback_query_id, "开始更新容器...")
+            
+            # 在新线程中执行更新，避免阻塞
+            def update_thread():
+                current_msg = f"⏳ 正在更新容器 <code>{container}</code>...\n\n"
+                self.bot.edit_message(chat_id, message_id, current_msg + "📋 准备更新...")
+
+                def progress_update(msg):
+                    self.bot.edit_message(chat_id, message_id, current_msg + msg)
+
+                result = self.docker.update_container(container, progress_update)
+
+                if result['success']:
+                    result_msg = f"""✅ <b>更新成功</b>
+
+━━━━━━━━━━━━━━━━━━━━
+🖥️ 服务器: <code>{server}</code>
+📦 容器: <code>{container}</code>
+
+🔄 <b>版本变更</b>
+   旧: <code>{result['old_version']}</code>
+   新: <code>{result['new_version']}</code>
+
+⏰ 时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
+━━━━━━━━━━━━━━━━━━━━
+
+{result['message']}"""
+                else:
+                    result_msg = f"""❌ <b>更新失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+🖥️ 服务器: <code>{server}</code>
+📦 容器: <code>{container}</code>
+
+❌ <b>错误信息</b>
+   {result['message']}
+
+💡 <b>建议</b>
+   • 检查镜像名称是否正确
+   • 查看容器日志排查问题
+   • 尝试手动更新容器
+━━━━━━━━━━━━━━━━━━━━"""
+
+                self.bot.edit_message(chat_id, message_id, result_msg)
+
+            threading.Thread(target=update_thread, daemon=True).start()
 
         elif action == 'restart_srv':
             server = parts[1]
@@ -957,8 +1175,6 @@ class BotPoller(threading.Thread):
                     if text and chat_id == CHAT_ID:
                         if self.coordinator.should_handle_command(text):
                             self._handle_command(text, chat_id)
-                        else:
-                            logger.info(f"跳过命令处理: {text}")
 
                     # 处理回调查询
                     callback_query = update.get('callback_query', {})
@@ -966,8 +1182,6 @@ class BotPoller(threading.Thread):
                         callback_data = callback_query.get('data', '')
                         if self.coordinator.should_handle_command(None, callback_data):
                             self._handle_callback(callback_query)
-                        else:
-                            logger.info(f"跳过回调处理: {callback_data}")
 
             except Exception as e:
                 logger.error(f"轮询错误: {e}")
@@ -1292,22 +1506,27 @@ def main():
     print("=" * 50)
     print(f"Docker 容器监控通知服务 v{VERSION}")
     print(f"服务器: {SERVER_NAME}")
+    print(f"主服务器: {PRIMARY_SERVER}")
     print(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Python 版本: {sys.version.split()[0]}")
     print("=" * 50)
     print()
 
+    is_primary = (SERVER_NAME == PRIMARY_SERVER)
+    
     bot = TelegramBot(os.getenv('BOT_TOKEN'), CHAT_ID, SERVER_NAME)
     docker = DockerManager()
     config = ConfigManager(MONITOR_CONFIG, SERVER_NAME)
-    registry = ServerRegistry(SERVER_REGISTRY, SERVER_NAME)
-    coordinator = CommandCoordinator(SERVER_NAME, SERVER_REGISTRY)
+    registry = ServerRegistry(SERVER_REGISTRY, SERVER_NAME, is_primary)
+    coordinator = CommandCoordinator(SERVER_NAME, PRIMARY_SERVER, SERVER_REGISTRY)
 
-    # 等待一下，让其他服务器先注册
-    logger.info("等待 2 秒后注册服务器...")
-    time.sleep(2)
-
+    # 立即注册服务器（主服务器无需等待）
     registry.register()
+    
+    # 从服务器等待0.5秒，让主服务器先注册
+    if not is_primary:
+        logger.info("从服务器等待 0.5 秒...")
+        time.sleep(0.5)
 
     handler = CommandHandler(bot, docker, config, registry)
 
@@ -1325,15 +1544,22 @@ def main():
 
     logger.info(f"总容器: {len(all_containers)}, 监控: {len(monitored)}, 排除: {len(excluded)}")
 
-    servers = registry.get_active_servers()
-    server_list = "\n".join([f"   • <code>{s}</code>" for s in servers])
+    # 只有主服务器发送启动消息
+    if is_primary:
+        time.sleep(1)  # 等待其他服务器注册
+        servers = registry.get_active_servers()
+        server_list = "\n".join([
+            f"   • <code>{s}</code>{' 🌟' if s == PRIMARY_SERVER else ''}" 
+            for s in servers
+        ])
 
-    startup_msg = f"""🚀 <b>监控服务启动成功</b>
+        startup_msg = f"""🚀 <b>监控服务启动成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📊 <b>服务信息</b>
    版本: <code>v{VERSION}</code>
-   服务器: <code>{SERVER_NAME}</code>
+   主服务器: <code>{PRIMARY_SERVER}</code> 🌟
+   当前服务器: <code>{SERVER_NAME}</code>
    语言: <code>Python {sys.version.split()[0]}</code>
 
 🎯 <b>监控状态</b>
@@ -1345,16 +1571,17 @@ def main():
 {server_list}
 
 🤖 <b>机器人功能</b>
-   /status - 查看状态
-   /update - 更新容器
+   /status - 查看服务器状态
+   /update - 更新容器镜像
    /restart - 重启容器
    /monitor - 监控管理
    /help - 显示帮助
 
-💡 <b>修复内容 v5.2.2</b>
-   • 修复回调处理需要点击两次的问题
-   • 优化服务器选择和容器列表显示
-   • 改进回调协调逻辑
+💡 <b>新特性 v5.3.0</b>
+   • 添加主服务器优先协调机制
+   • 实现单容器更新功能
+   • 优化启动响应速度
+   • 修复命令延迟响应问题
 
 ⏰ <b>启动时间</b>
    <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
@@ -1362,7 +1589,9 @@ def main():
 
 ✅ 服务正常运行中"""
 
-    bot.send_message(startup_msg)
+        bot.send_message(startup_msg)
+    else:
+        logger.info(f"从服务器已启动，等待主服务器 {PRIMARY_SERVER} 协调")
 
     def signal_handler(signum, frame):
         logger.info("收到退出信号，正在关闭...")
