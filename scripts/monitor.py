@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Docker 容器监控通知服务 v5.0.0
-支持多服务器管理、Telegram Bot 交互
+Docker 容器监控通知服务 v5.1.0
+修复多服务器重复响应问题
 """
 
 import os
@@ -20,7 +20,7 @@ from pathlib import Path
 
 # ==================== 配置和常量 ====================
 
-VERSION = "5.0.0"
+VERSION = "5.1.0"
 TELEGRAM_API = f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN')}"
 CHAT_ID = os.getenv('CHAT_ID')
 SERVER_NAME = os.getenv('SERVER_NAME')
@@ -30,6 +30,7 @@ DATA_DIR = Path("/data")
 STATE_FILE = DATA_DIR / "container_state.json"
 MONITOR_CONFIG = DATA_DIR / "monitor_config.json"
 SERVER_REGISTRY = DATA_DIR / "server_registry.json"
+COMMAND_LOCK = DATA_DIR / "command.lock"
 
 # 确保数据目录存在
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -48,16 +49,79 @@ shutdown_flag = threading.Event()
 
 # ==================== 工具类 ====================
 
+class CommandCoordinator:
+    """命令协调器 - 防止多服务器重复响应"""
+    
+    def __init__(self, server_name: str, registry_file: Path, lock_file: Path):
+        self.server_name = server_name
+        self.registry_file = registry_file
+        self.lock_file = lock_file
+        self.lock_timeout = 5
+    
+    def should_handle_command(self, command: str) -> bool:
+        """判断当前服务器是否应该处理该命令"""
+        # 不需要协调的命令（服务器特定命令）
+        server_specific = ['status_detail', 'update_detail', 'restart_detail']
+        if any(cmd in command for cmd in server_specific):
+            return True
+        
+        # 需要协调的命令
+        coordinated_commands = ['/status', '/update', '/restart', '/monitor', '/help', '/start']
+        if not any(command.startswith(cmd) for cmd in coordinated_commands):
+            return True
+        
+        # 获取活跃服务器列表
+        servers = self._get_active_servers()
+        if not servers:
+            return True
+        
+        # 如果只有当前服务器，直接处理
+        if len(servers) == 1 and servers[0] == self.server_name:
+            return True
+        
+        # 多服务器情况：选择协调者（按字母顺序第一个）
+        coordinator = sorted(servers)[0]
+        is_coordinator = (self.server_name == coordinator)
+        
+        if is_coordinator:
+            logger.info(f"✓ 当前服务器是协调者，处理命令: {command}")
+        else:
+            logger.info(f"✗ 非协调者，忽略命令: {command} (协调者: {coordinator})")
+        
+        return is_coordinator
+    
+    def _get_active_servers(self) -> List[str]:
+        """获取活跃的服务器列表"""
+        if not self.registry_file.exists():
+            return [self.server_name]
+        
+        try:
+            with open(self.registry_file, 'r', encoding='utf-8') as f:
+                registry = json.load(f)
+            
+            current_time = time.time()
+            active_servers = []
+            
+            for server, info in registry.items():
+                if current_time - info.get('last_heartbeat', 0) < 90:
+                    active_servers.append(server)
+            
+            return sorted(active_servers) if active_servers else [self.server_name]
+        except Exception as e:
+            logger.error(f"读取注册表失败: {e}")
+            return [self.server_name]
+
+
 class TelegramBot:
     """Telegram Bot API 封装"""
-    
+
     def __init__(self, token: str, chat_id: str, server_name: str):
         self.api_url = f"https://api.telegram.org/bot{token}"
         self.chat_id = chat_id
-        self.server_tag = f"<b>[{server_name}]</b> "
+        self.server_name = server_name
         self.session = requests.Session()
         self.session.headers.update({'Connection': 'keep-alive'})
-    
+
     def send_message(self, text: str, reply_markup: Optional[Dict] = None, 
                      max_retries: int = 3) -> bool:
         """发送 Telegram 消息"""
@@ -65,36 +129,36 @@ class TelegramBot:
             try:
                 payload = {
                     'chat_id': self.chat_id,
-                    'text': self.server_tag + text,
+                    'text': text,
                     'parse_mode': 'HTML'
                 }
                 if reply_markup:
                     payload['reply_markup'] = json.dumps(reply_markup)
-                
+
                 response = self.session.post(
                     f"{self.api_url}/sendMessage",
                     json=payload,
                     timeout=30
                 )
-                
+
                 if response.status_code == 200 and response.json().get('ok'):
                     logger.info("✓ Telegram 消息发送成功")
                     return True
                 else:
                     error_desc = response.json().get('description', '未知错误')
                     logger.error(f"✗ Telegram API 错误: {error_desc}")
-                    
+
             except Exception as e:
                 logger.error(f"✗ 发送失败: {e}")
-            
+
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 5
                 logger.info(f"↻ {wait_time}秒后重试 ({attempt + 1}/{max_retries})...")
                 time.sleep(wait_time)
-        
+
         logger.error(f"✗ Telegram 消息最终失败 (已重试 {max_retries} 次)")
         return False
-    
+
     def edit_message(self, chat_id: str, message_id: str, text: str, 
                      reply_markup: Optional[Dict] = None) -> bool:
         """编辑消息"""
@@ -107,7 +171,7 @@ class TelegramBot:
             }
             if reply_markup:
                 payload['reply_markup'] = json.dumps(reply_markup)
-            
+
             response = self.session.post(
                 f"{self.api_url}/editMessageText",
                 json=payload,
@@ -117,7 +181,7 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"编辑消息失败: {e}")
             return False
-    
+
     def answer_callback(self, callback_query_id: str, text: str) -> bool:
         """回应回调查询"""
         try:
@@ -130,7 +194,7 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"回应回调失败: {e}")
             return False
-    
+
     def get_updates(self, offset: int = 0, timeout: int = 30) -> Optional[List]:
         """获取更新"""
         try:
@@ -150,7 +214,7 @@ class TelegramBot:
 
 class DockerManager:
     """Docker 容器管理"""
-    
+
     @staticmethod
     def get_all_containers() -> List[str]:
         """获取所有容器（排除监控相关容器）"""
@@ -166,7 +230,7 @@ class DockerManager:
         except Exception as e:
             logger.error(f"获取容器列表失败: {e}")
         return []
-    
+
     @staticmethod
     def get_container_info(container: str) -> Dict:
         """获取容器详细信息"""
@@ -189,7 +253,7 @@ class DockerManager:
         except Exception as e:
             logger.error(f"获取容器 {container} 信息失败: {e}")
         return {}
-    
+
     @staticmethod
     def restart_container(container: str) -> bool:
         """重启容器"""
@@ -202,15 +266,14 @@ class DockerManager:
         except Exception as e:
             logger.error(f"重启容器 {container} 失败: {e}")
             return False
-    
+
     @staticmethod
     def get_danmu_version(container: str) -> Optional[str]:
         """获取 danmu-api 版本"""
         if 'danmu' not in container.lower():
             return None
-        
+
         try:
-            # 等待容器就绪
             for _ in range(30):
                 check = subprocess.run(
                     ['docker', 'exec', container, 'test', '-f', 
@@ -220,14 +283,13 @@ class DockerManager:
                 if check.returncode == 0:
                     break
                 time.sleep(1)
-            
-            # 读取版本
+
             result = subprocess.run(
                 ['docker', 'exec', container, 'cat', 
                  '/app/danmu_api/configs/globals.js'],
                 capture_output=True, text=True, timeout=10
             )
-            
+
             if result.returncode == 0:
                 for line in result.stdout.split('\n'):
                     if 'VERSION:' in line:
@@ -237,18 +299,18 @@ class DockerManager:
                             return match.group(1)
         except Exception as e:
             logger.debug(f"获取 danmu 版本失败: {e}")
-        
+
         return None
 
 
 class ConfigManager:
     """配置管理器"""
-    
+
     def __init__(self, config_file: Path, server_name: str):
         self.config_file = config_file
         self.server_name = server_name
         self.config = self._load_config()
-    
+
     def _load_config(self) -> Dict:
         """加载配置"""
         if self.config_file.exists():
@@ -258,7 +320,7 @@ class ConfigManager:
             except Exception as e:
                 logger.error(f"加载配置失败: {e}")
         return {}
-    
+
     def _save_config(self):
         """保存配置"""
         try:
@@ -266,23 +328,23 @@ class ConfigManager:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"保存配置失败: {e}")
-    
+
     def get_excluded_containers(self, server: Optional[str] = None) -> Set[str]:
         """获取排除的容器列表"""
         server = server or self.server_name
         return set(self.config.get(server, {}).get('excluded', []))
-    
+
     def add_excluded(self, container: str, server: Optional[str] = None):
         """添加到排除列表"""
         server = server or self.server_name
         if server not in self.config:
             self.config[server] = {'excluded': []}
-        
+
         excluded = set(self.config[server].get('excluded', []))
         excluded.add(container)
         self.config[server]['excluded'] = sorted(list(excluded))
         self._save_config()
-    
+
     def remove_excluded(self, container: str, server: Optional[str] = None):
         """从排除列表移除"""
         server = server or self.server_name
@@ -291,21 +353,21 @@ class ConfigManager:
             excluded.discard(container)
             self.config[server]['excluded'] = sorted(list(excluded))
             self._save_config()
-    
+
     def is_monitored(self, container: str, server: Optional[str] = None) -> bool:
         """检查容器是否被监控"""
         return container not in self.get_excluded_containers(server)
 
 
 class ServerRegistry:
-    """服务器注册中心 - 使用文件实现服务发现"""
-    
+    """服务器注册中心"""
+
     def __init__(self, registry_file: Path, server_name: str):
         self.registry_file = registry_file
         self.server_name = server_name
-        self.heartbeat_interval = 30  # 心跳间隔（秒）
-        self.timeout = 90  # 超时时间（秒）
-    
+        self.heartbeat_interval = 30
+        self.timeout = 90
+
     def register(self):
         """注册当前服务器"""
         registry = self._load_registry()
@@ -315,26 +377,26 @@ class ServerRegistry:
         }
         self._save_registry(registry)
         logger.info(f"服务器已注册: {self.server_name}")
-    
+
     def heartbeat(self):
         """发送心跳"""
         registry = self._load_registry()
         if self.server_name in registry:
             registry[self.server_name]['last_heartbeat'] = time.time()
             self._save_registry(registry)
-    
+
     def get_active_servers(self) -> List[str]:
         """获取活跃的服务器列表"""
         registry = self._load_registry()
         current_time = time.time()
         active_servers = []
-        
+
         for server, info in registry.items():
             if current_time - info.get('last_heartbeat', 0) < self.timeout:
                 active_servers.append(server)
-        
+
         return sorted(active_servers)
-    
+
     def _load_registry(self) -> Dict:
         """加载注册表"""
         if self.registry_file.exists():
@@ -344,7 +406,7 @@ class ServerRegistry:
             except Exception as e:
                 logger.error(f"加载注册表失败: {e}")
         return {}
-    
+
     def _save_registry(self, registry: Dict):
         """保存注册表"""
         try:
@@ -358,25 +420,47 @@ class ServerRegistry:
 
 class CommandHandler:
     """命令处理器"""
-    
+
     def __init__(self, bot: TelegramBot, docker: DockerManager, 
-                 config: ConfigManager, registry: ServerRegistry):
+                 config: ConfigManager, registry: ServerRegistry,
+                 coordinator: CommandCoordinator):
         self.bot = bot
         self.docker = docker
         self.config = config
         self.registry = registry
-    
+        self.coordinator = coordinator
+
     def handle_status(self, chat_id: str):
         """处理 /status 命令"""
+        servers = self.registry.get_active_servers()
+        
+        # 多服务器：显示选择菜单
+        if len(servers) > 1:
+            buttons = {
+                'inline_keyboard': [
+                    [{'text': f"🖥️ {srv}", 'callback_data': f"status_srv:{srv}"}]
+                    for srv in servers
+                ]
+            }
+            self.bot.send_message("📊 <b>选择要查看状态的服务器：</b>", buttons)
+        else:
+            # 单服务器：直接显示状态
+            self._show_server_status(chat_id, SERVER_NAME)
+
+    def _show_server_status(self, chat_id: str, server: str):
+        """显示指定服务器的状态"""
+        if server != SERVER_NAME:
+            return
+        
         all_containers = self.docker.get_all_containers()
         monitored = [c for c in all_containers if self.config.is_monitored(c)]
         excluded = self.config.get_excluded_containers()
-        
+
         status_msg = f"""📊 <b>服务器状态</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 🖥️ <b>服务器信息</b>
-   名称: <code>{SERVER_NAME}</code>
+   名称: <code>{server}</code>
    时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
    版本: <code>v{VERSION}</code>
 
@@ -386,7 +470,7 @@ class CommandHandler:
    已排除: <code>{len(excluded)}</code>
 
 🔍 <b>监控列表</b>"""
-        
+
         if not monitored:
             status_msg += "\n   <i>暂无监控容器</i>"
         else:
@@ -395,28 +479,24 @@ class CommandHandler:
                 status_icon = "✅" if info.get('running') else "❌"
                 tag = info.get('image', '').split(':')[-1] or 'latest'
                 status_msg += f"\n   {status_icon} <code>{container}</code> [{tag}]"
-        
+
         if excluded:
             status_msg += "\n\n🚫 <b>排除列表</b>"
             for container in sorted(excluded):
                 status_msg += f"\n   • <code>{container}</code>"
-        
+
         status_msg += "\n━━━━━━━━━━━━━━━━━━━━"
         self.bot.send_message(status_msg)
-    
+
     def handle_update(self, chat_id: str):
         """处理 /update 命令"""
         servers = self.registry.get_active_servers()
-        
+
         if not servers:
             self.bot.send_message("⚠️ 没有可用的服务器")
             return
-        
-        if len(servers) == 1:
-            # 单服务器直接显示容器列表
-            self._show_update_containers(chat_id, servers[0])
-        else:
-            # 多服务器选择
+
+        if len(servers) > 1:
             buttons = {
                 'inline_keyboard': [
                     [{'text': f"🖥️ {srv}", 'callback_data': f"update_srv:{srv}"}]
@@ -424,24 +504,21 @@ class CommandHandler:
                 ]
             }
             self.bot.send_message("🔄 <b>选择要更新容器的服务器：</b>", buttons)
-    
+        else:
+            self._show_update_containers(chat_id, servers[0])
+
     def _show_update_containers(self, chat_id: str, server: str):
         """显示可更新的容器列表"""
-        if server == SERVER_NAME:
-            containers = [c for c in self.docker.get_all_containers() 
-                         if self.config.is_monitored(c)]
-        else:
-            # 跨服务器操作需要提示
-            self.bot.send_message(
-                f"⚠️ 无法直接操作服务器 <code>{server}</code>\n"
-                f"请在对应服务器上执行操作"
-            )
+        if server != SERVER_NAME:
             return
         
+        containers = [c for c in self.docker.get_all_containers() 
+                     if self.config.is_monitored(c)]
+
         if not containers:
             self.bot.send_message(f"⚠️ 服务器 <code>{server}</code> 没有可更新的容器")
             return
-        
+
         buttons = {
             'inline_keyboard': [
                 [{'text': f"📦 {c}", 'callback_data': f"update_cnt:{server}:{c}"}]
@@ -452,18 +529,16 @@ class CommandHandler:
             f"🔄 <b>服务器 <code>{server}</code></b>\n\n请选择要更新的容器：",
             buttons
         )
-    
+
     def handle_restart(self, chat_id: str):
         """处理 /restart 命令"""
         servers = self.registry.get_active_servers()
-        
+
         if not servers:
             self.bot.send_message("⚠️ 没有可用的服务器")
             return
-        
-        if len(servers) == 1:
-            self._show_restart_containers(chat_id, servers[0])
-        else:
+
+        if len(servers) > 1:
             buttons = {
                 'inline_keyboard': [
                     [{'text': f"🖥️ {srv}", 'callback_data': f"restart_srv:{srv}"}]
@@ -471,22 +546,20 @@ class CommandHandler:
                 ]
             }
             self.bot.send_message("🔄 <b>选择要重启容器的服务器：</b>", buttons)
-    
+        else:
+            self._show_restart_containers(chat_id, servers[0])
+
     def _show_restart_containers(self, chat_id: str, server: str):
         """显示可重启的容器列表"""
-        if server == SERVER_NAME:
-            containers = self.docker.get_all_containers()
-        else:
-            self.bot.send_message(
-                f"⚠️ 无法直接操作服务器 <code>{server}</code>\n"
-                f"请在对应服务器上执行操作"
-            )
+        if server != SERVER_NAME:
             return
         
+        containers = self.docker.get_all_containers()
+
         if not containers:
             self.bot.send_message(f"⚠️ 服务器 <code>{server}</code> 没有可重启的容器")
             return
-        
+
         buttons = {
             'inline_keyboard': [
                 [{'text': f"🔄 {c}", 'callback_data': f"restart_cnt:{server}:{c}"}]
@@ -497,7 +570,7 @@ class CommandHandler:
             f"🔄 <b>服务器 <code>{server}</code></b>\n\n请选择要重启的容器：",
             buttons
         )
-    
+
     def handle_monitor(self, chat_id: str):
         """处理 /monitor 命令"""
         buttons = {
@@ -508,18 +581,18 @@ class CommandHandler:
             ]
         }
         self.bot.send_message("📡 <b>监控管理</b>\n\n请选择操作：", buttons)
-    
+
     def handle_help(self):
         """处理 /help 命令"""
         servers = self.registry.get_active_servers()
         server_list = "\n".join([f"   • <code>{s}</code>" for s in servers])
-        
+
         help_msg = f"""📖 <b>命令帮助</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 <b>可用命令：</b>
 
-/status - 查看当前服务器状态
+/status - 查看服务器状态
 /update - 更新容器镜像
 /restart - 重启容器
 /monitor - 监控管理
@@ -532,42 +605,40 @@ class CommandHandler:
 ━━━━━━━━━━━━━━━━━━━━
 💡 <b>使用提示：</b>
 
-• 所有操作通过按钮选择
-• 多服务器会自动列出选项
-• 跨服务器操作需在目标服务器执行
-• 每条消息标注来源服务器
+• 多服务器时先选择服务器
+• 然后选择要操作的容器
+• 所有操作通过按钮完成
 • 使用 /status 查看实时状态
 ━━━━━━━━━━━━━━━━━━━━"""
-        
+
         self.bot.send_message(help_msg)
-    
+
     def handle_callback(self, callback_data: str, callback_query_id: str, 
                        chat_id: str, message_id: str):
         """处理回调查询"""
         parts = callback_data.split(':')
         action = parts[0]
-        
-        if action == 'update_srv':
+
+        if action == 'status_srv':
+            server = parts[1]
+            self.bot.answer_callback(callback_query_id, f"正在获取 {server} 状态...")
+            self._show_server_status(chat_id, server)
+
+        elif action == 'update_srv':
             server = parts[1]
             self.bot.answer_callback(callback_query_id, "正在加载容器列表...")
             self._show_update_containers(chat_id, server)
-        
+
         elif action == 'restart_srv':
             server = parts[1]
             self.bot.answer_callback(callback_query_id, "正在加载容器列表...")
             self._show_restart_containers(chat_id, server)
-        
+
         elif action == 'restart_cnt':
             server, container = parts[1], parts[2]
             if server != SERVER_NAME:
-                self.bot.answer_callback(callback_query_id, "无法操作其他服务器")
-                self.bot.edit_message(
-                    chat_id, message_id,
-                    f"❌ 当前服务器无法操作 <code>{server}</code> 的容器"
-                )
                 return
-            
-            # 确认对话框
+
             confirm_msg = f"""⚠️ <b>确认重启</b>
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -576,7 +647,7 @@ class CommandHandler:
 
 是否继续？
 ━━━━━━━━━━━━━━━━━━━━"""
-            
+
             buttons = {
                 'inline_keyboard': [
                     [{'text': "✅ 确认重启", 
@@ -586,18 +657,20 @@ class CommandHandler:
             }
             self.bot.answer_callback(callback_query_id, "准备重启...")
             self.bot.edit_message(chat_id, message_id, confirm_msg, buttons)
-        
+
         elif action == 'confirm_restart':
             server, container = parts[1], parts[2]
+            if server != SERVER_NAME:
+                return
+
             self.bot.answer_callback(callback_query_id, "开始重启容器...")
             self.bot.edit_message(
                 chat_id, message_id,
                 f"⏳ 正在重启容器 <code>{container}</code>..."
             )
-            
-            # 执行重启
+
             success = self.docker.restart_container(container)
-            
+
             if success:
                 result_msg = f"""✅ <b>重启成功</b>
 
@@ -615,9 +688,9 @@ class CommandHandler:
 
 请检查容器状态
 ━━━━━━━━━━━━━━━━━━━━"""
-            
+
             self.bot.edit_message(chat_id, message_id, result_msg)
-        
+
         elif action == 'monitor_action':
             action_type = parts[1]
             if action_type == 'list':
@@ -642,18 +715,17 @@ class CommandHandler:
                         f"📡 <b>{action_text}</b>\n\n请选择服务器：",
                         buttons
                     )
-        
+
         elif action == 'monitor_srv':
             action_type, server = parts[1], parts[2]
             self.bot.answer_callback(callback_query_id, "正在加载容器列表...")
             self._handle_monitor_server(chat_id, message_id, action_type, server)
-        
+
         elif action == 'add_mon':
             server, container = parts[1], parts[2]
             if server != SERVER_NAME:
-                self.bot.answer_callback(callback_query_id, "无法操作其他服务器")
                 return
-            
+
             self.config.remove_excluded(container)
             self.bot.answer_callback(callback_query_id, "已添加到监控列表")
             self.bot.edit_message(
@@ -667,13 +739,12 @@ class CommandHandler:
 已将容器添加到监控列表
 ━━━━━━━━━━━━━━━━━━━━"""
             )
-        
+
         elif action == 'rem_mon':
             server, container = parts[1], parts[2]
             if server != SERVER_NAME:
-                self.bot.answer_callback(callback_query_id, "无法操作其他服务器")
                 return
-            
+
             self.config.add_excluded(container)
             self.bot.answer_callback(callback_query_id, "已从监控列表移除")
             self.bot.edit_message(
@@ -687,22 +758,17 @@ class CommandHandler:
 已将容器从监控列表移除
 ━━━━━━━━━━━━━━━━━━━━"""
             )
-        
+
         elif action == 'cancel':
             self.bot.answer_callback(callback_query_id, "已取消操作")
             self.bot.edit_message(chat_id, message_id, "❌ 操作已取消")
-    
+
     def _handle_monitor_server(self, chat_id: str, message_id: str, 
                                action: str, server: str):
         """处理监控服务器选择"""
         if server != SERVER_NAME:
-            self.bot.edit_message(
-                chat_id, message_id,
-                f"⚠️ 无法直接操作服务器 <code>{server}</code>\n"
-                f"请在对应服务器上执行操作"
-            )
             return
-        
+
         if action == 'add':
             excluded = self.config.get_excluded_containers()
             if not excluded:
@@ -711,7 +777,7 @@ class CommandHandler:
                     f"✅ 服务器 <code>{server}</code> 所有容器都已在监控中"
                 )
                 return
-            
+
             buttons = {
                 'inline_keyboard': [
                     [{'text': f"➕ {c}", 'callback_data': f"add_mon:{server}:{c}"}]
@@ -723,18 +789,18 @@ class CommandHandler:
                 f"📡 <b>添加监控</b>\n\n🖥️ 服务器: <code>{server}</code>\n\n请选择要添加监控的容器：",
                 buttons
             )
-        
-        else:  # remove
+
+        else:
             all_containers = self.docker.get_all_containers()
             monitored = [c for c in all_containers if self.config.is_monitored(c)]
-            
+
             if not monitored:
                 self.bot.edit_message(
                     chat_id, message_id,
                     f"⚠️ 服务器 <code>{server}</code> 当前没有监控中的容器"
                 )
                 return
-            
+
             buttons = {
                 'inline_keyboard': [
                     [{'text': f"➖ {c}", 'callback_data': f"rem_mon:{server}:{c}"}]
@@ -752,44 +818,45 @@ class CommandHandler:
 
 class BotPoller(threading.Thread):
     """Bot 消息轮询线程"""
-    
-    def __init__(self, handler: CommandHandler, bot: TelegramBot):
+
+    def __init__(self, handler: CommandHandler, bot: TelegramBot, 
+                 coordinator: CommandCoordinator):
         super().__init__(daemon=True)
         self.handler = handler
         self.bot = bot
+        self.coordinator = coordinator
         self.last_update_id = 0
-    
+
     def run(self):
         """运行轮询"""
         logger.info("Bot 轮询线程已启动")
-        
+
         while not shutdown_flag.is_set():
             try:
                 updates = self.bot.get_updates(self.last_update_id + 1)
-                
+
                 if not updates:
                     continue
-                
+
                 for update in updates:
                     self.last_update_id = update.get('update_id', self.last_update_id)
-                    
-                    # 处理命令消息
+
                     message = update.get('message', {})
                     text = message.get('text', '')
                     chat_id = str(message.get('chat', {}).get('id', ''))
-                    
+
                     if text and chat_id == CHAT_ID:
-                        self._handle_command(text, chat_id)
-                    
-                    # 处理回调查询
+                        if self.coordinator.should_handle_command(text):
+                            self._handle_command(text, chat_id)
+
                     callback_query = update.get('callback_query', {})
                     if callback_query:
                         self._handle_callback(callback_query)
-                
+
             except Exception as e:
                 logger.error(f"轮询错误: {e}")
                 time.sleep(5)
-    
+
     def _handle_command(self, text: str, chat_id: str):
         """处理命令"""
         try:
@@ -805,7 +872,7 @@ class BotPoller(threading.Thread):
                 self.handler.handle_help()
         except Exception as e:
             logger.error(f"处理命令失败: {e}")
-    
+
     def _handle_callback(self, callback_query: Dict):
         """处理回调"""
         try:
@@ -813,7 +880,7 @@ class BotPoller(threading.Thread):
             callback_query_id = callback_query.get('id', '')
             chat_id = str(callback_query.get('message', {}).get('chat', {}).get('id', ''))
             message_id = str(callback_query.get('message', {}).get('message_id', ''))
-            
+
             if chat_id == CHAT_ID:
                 self.handler.handle_callback(
                     callback_data, callback_query_id, chat_id, message_id
@@ -826,15 +893,15 @@ class BotPoller(threading.Thread):
 
 class HeartbeatThread(threading.Thread):
     """服务器心跳线程"""
-    
+
     def __init__(self, registry: ServerRegistry):
         super().__init__(daemon=True)
         self.registry = registry
-    
+
     def run(self):
         """运行心跳"""
         logger.info("心跳线程已启动")
-        
+
         while not shutdown_flag.is_set():
             try:
                 self.registry.heartbeat()
@@ -848,22 +915,19 @@ class HeartbeatThread(threading.Thread):
 
 class WatchtowerMonitor:
     """Watchtower 日志监控"""
-    
+
     def __init__(self, bot: TelegramBot, docker: DockerManager, 
                  config: ConfigManager):
         self.bot = bot
         self.docker = docker
         self.config = config
         self.session_data = {}
-    
+
     def start(self):
         """开始监控"""
         logger.info("开始监控 Watchtower 日志...")
-        
-        # 等待 Watchtower 启动
         self._wait_for_watchtower()
-        
-        # 启动日志监控
+
         try:
             process = subprocess.Popen(
                 ['docker', 'logs', '-f', '--tail', '0', 'watchtower'],
@@ -872,25 +936,25 @@ class WatchtowerMonitor:
                 text=True,
                 bufsize=1
             )
-            
+
             for line in iter(process.stdout.readline, ''):
                 if shutdown_flag.is_set():
                     break
-                
+
                 line = line.strip()
                 if not line:
                     continue
-                
+
                 logger.info(line)
                 self._process_log_line(line)
-            
+
         except Exception as e:
             logger.error(f"监控 Watchtower 日志失败: {e}")
-    
+
     def _wait_for_watchtower(self):
         """等待 Watchtower 启动"""
         logger.info("正在等待 Watchtower 容器启动...")
-        
+
         for _ in range(60):
             try:
                 result = subprocess.run(
@@ -904,37 +968,34 @@ class WatchtowerMonitor:
             except Exception:
                 pass
             time.sleep(2)
-        
+
         logger.warning("Watchtower 启动超时，继续监控")
-    
+
     def _process_log_line(self, line: str):
         """处理日志行"""
         try:
-            # 检测容器停止
             if 'Stopping /' in line:
                 container = self._extract_container_name(line, 'Stopping /')
                 if container and self.config.is_monitored(container):
                     logger.info(f"→ 捕获到停止: {container}")
                     self._store_old_state(container)
-            
-            # 检测 Session 完成
+
             elif 'Session done' in line:
                 import re
                 match = re.search(r'Updated=(\d+)', line)
                 if match:
                     updated = int(match.group(1))
                     logger.info(f"→ Session 完成: Updated={updated}")
-                    
+
                     if updated > 0 and self.session_data:
                         self._process_updates()
-            
-            # 检测严重错误
+
             elif 'level=error' in line.lower() or 'level=fatal' in line.lower():
                 self._process_error(line)
-        
+
         except Exception as e:
             logger.error(f"处理日志行失败: {e}")
-    
+
     def _extract_container_name(self, line: str, prefix: str) -> Optional[str]:
         """从日志行提取容器名"""
         try:
@@ -948,7 +1009,7 @@ class WatchtowerMonitor:
         except Exception:
             pass
         return None
-    
+
     def _store_old_state(self, container: str):
         """存储旧状态"""
         try:
@@ -962,21 +1023,20 @@ class WatchtowerMonitor:
                 logger.info(f"  → 已暂存 {container} 的旧信息")
         except Exception as e:
             logger.error(f"存储旧状态失败: {e}")
-    
+
     def _process_updates(self):
         """处理更新"""
         logger.info(f"→ 发现 {len(self.session_data)} 个更新，开始处理...")
-        
+
         for container, old_state in self.session_data.items():
             try:
                 if not self.config.is_monitored(container):
                     logger.info(f"→ {container} 已被排除，跳过处理")
                     continue
-                
+
                 logger.info(f"→ 处理容器: {container}")
-                time.sleep(5)  # 等待容器启动
-                
-                # 等待容器运行
+                time.sleep(5)
+
                 for _ in range(60):
                     info = self.docker.get_container_info(container)
                     if info.get('running'):
@@ -984,20 +1044,17 @@ class WatchtowerMonitor:
                         time.sleep(5)
                         break
                     time.sleep(1)
-                
-                # 获取新状态
+
                 new_info = self.docker.get_container_info(container)
                 new_version = self.docker.get_danmu_version(container)
-                
-                # 格式化版本信息
+
                 old_ver = self._format_version(old_state, container)
                 new_ver = self._format_version({
                     'image': new_info.get('image', 'unknown'),
                     'image_id': new_info.get('image_id', 'unknown'),
                     'version': new_version
                 }, container)
-                
-                # 发送通知
+
                 self._send_update_notification(
                     container, 
                     new_info.get('image', 'unknown').split(':')[0],
@@ -1005,31 +1062,31 @@ class WatchtowerMonitor:
                     new_ver,
                     new_info.get('running', False)
                 )
-                
+
             except Exception as e:
                 logger.error(f"处理容器 {container} 更新失败: {e}")
-        
+
         self.session_data.clear()
         logger.info("→ 所有更新处理完成")
-    
+
     def _format_version(self, state: Dict, container: str) -> str:
         """格式化版本信息"""
         image_id = state.get('image_id', 'unknown')
         id_short = image_id.replace('sha256:', '')[:12]
-        
+
         if 'danmu' in container.lower() and state.get('version'):
             return f"v{state['version']} ({id_short})"
         else:
             tag = state.get('image', 'unknown:latest').split(':')[-1]
             return f"{tag} ({id_short})"
-    
+
     def _send_update_notification(self, container: str, image: str, 
                                    old_ver: str, new_ver: str, running: bool):
         """发送更新通知"""
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
+
         if running:
-            message = f"""✨ <b>容器更新成功</b>
+            message = f"""<b>[{self.bot.server_name}]</b> ✨ <b>容器更新成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📦 <b>容器名称</b>
@@ -1049,7 +1106,7 @@ class WatchtowerMonitor:
 
 ✅ 容器已成功启动并运行正常"""
         else:
-            message = f"""❌ <b>容器启动失败</b>
+            message = f"""<b>[{self.bot.server_name}]</b> ❌ <b>容器启动失败</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📦 <b>容器名称</b>
@@ -1068,19 +1125,17 @@ class WatchtowerMonitor:
 
 ⚠️ 更新后无法启动
 💡 检查: <code>docker logs {container}</code>"""
-        
+
         logger.info("  → 发送通知...")
         self.bot.send_message(message)
-    
+
     def _process_error(self, line: str):
         """处理错误日志"""
-        # 过滤常见的非关键错误
         if any(keyword in line.lower() for keyword in 
                ['skipping', 'already up to date', 'no new images', 
                 'connection refused', 'timeout']):
             return
-        
-        # 提取容器名和错误信息
+
         container = None
         for pattern in ['container=', 'container:', 'container ']:
             if pattern in line.lower():
@@ -1093,11 +1148,11 @@ class WatchtowerMonitor:
                     break
                 except Exception:
                     pass
-        
+
         if container and container not in ['watchtower', 'watchtower-notifier']:
             if self.config.is_monitored(container):
                 error_msg = line[:200]
-                self.bot.send_message(f"""⚠️ <b>Watchtower 严重错误</b>
+                self.bot.send_message(f"""<b>[{self.bot.server_name}]</b> ⚠️ <b>Watchtower 严重错误</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📦 <b>容器</b>: <code>{container}</code>
@@ -1110,16 +1165,14 @@ class WatchtowerMonitor:
 
 def main():
     """主程序入口"""
-    # 验证环境变量
     if not SERVER_NAME:
         logger.error("错误: 必须设置 SERVER_NAME 环境变量")
         sys.exit(1)
-    
+
     if not CHAT_ID or not os.getenv('BOT_TOKEN'):
         logger.error("错误: 必须设置 BOT_TOKEN 和 CHAT_ID 环境变量")
         sys.exit(1)
-    
-    # 打印启动信息
+
     print("=" * 50)
     print(f"Docker 容器监控通知服务 v{VERSION}")
     print(f"服务器: {SERVER_NAME}")
@@ -1127,40 +1180,34 @@ def main():
     print(f"Python 版本: {sys.version.split()[0]}")
     print("=" * 50)
     print()
-    
-    # 初始化组件
+
     bot = TelegramBot(os.getenv('BOT_TOKEN'), CHAT_ID, SERVER_NAME)
     docker = DockerManager()
     config = ConfigManager(MONITOR_CONFIG, SERVER_NAME)
     registry = ServerRegistry(SERVER_REGISTRY, SERVER_NAME)
-    
-    # 注册服务器
+    coordinator = CommandCoordinator(SERVER_NAME, SERVER_REGISTRY, COMMAND_LOCK)
+
     registry.register()
-    
-    # 初始化命令处理器
-    handler = CommandHandler(bot, docker, config, registry)
-    
-    # 启动 Bot 轮询线程
-    bot_poller = BotPoller(handler, bot)
+
+    handler = CommandHandler(bot, docker, config, registry, coordinator)
+
+    bot_poller = BotPoller(handler, bot, coordinator)
     bot_poller.start()
     logger.info(f"Bot 轮询线程已启动")
-    
-    # 启动心跳线程
+
     heartbeat = HeartbeatThread(registry)
     heartbeat.start()
     logger.info(f"心跳线程已启动")
-    
-    # 获取容器统计信息
+
     all_containers = docker.get_all_containers()
     monitored = [c for c in all_containers if config.is_monitored(c)]
     excluded = config.get_excluded_containers()
-    
+
     logger.info(f"总容器: {len(all_containers)}, 监控: {len(monitored)}, 排除: {len(excluded)}")
-    
-    # 发送启动通知
+
     servers = registry.get_active_servers()
     server_list = "\n".join([f"   • <code>{s}</code>" for s in servers])
-    
+
     startup_msg = f"""🚀 <b>监控服务启动成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -1184,30 +1231,28 @@ def main():
    /monitor - 监控管理
    /help - 显示帮助
 
-💡 <b>新特性</b>
-   • Python 实现，更稳定
-   • 真正的多服务器支持
-   • 自动服务发现
-   • 更好的错误处理
+💡 <b>修复内容 v5.1.0</b>
+   • 修复多服务器重复响应
+   • 添加命令协调机制
+   • 优化消息显示逻辑
+   • 改进服务器选择流程
 
 ⏰ <b>启动时间</b>
    <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
 ━━━━━━━━━━━━━━━━━━━━
 
 ✅ 服务正常运行中"""
-    
+
     bot.send_message(startup_msg)
-    
-    # 设置信号处理
+
     def signal_handler(signum, frame):
         logger.info("收到退出信号，正在关闭...")
         shutdown_flag.set()
         sys.exit(0)
-    
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
-    # 启动 Watchtower 监控
+
     monitor = WatchtowerMonitor(bot, docker, config)
     try:
         monitor.start()
