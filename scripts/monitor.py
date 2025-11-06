@@ -141,7 +141,7 @@ class CommandCoordinator:
         if any(command.startswith(cmd) for cmd in global_commands):
             return True
 
-        coordinated_commands = ['/status', '/update', '/restart', '/monitor', '/help']
+        coordinated_commands = ['/status', '/update', '/restart', '/monitor', '/help', '/servers']
         if not any(command.startswith(cmd) for cmd in coordinated_commands):
             return True
 
@@ -578,22 +578,35 @@ class ServerRegistry:
 
     def register(self):
         registry = safe_read_json(self.registry_file, default={})
+        
+        # 获取当前服务器的容器信息
+        all_containers = DockerManager.get_all_containers()
+        config_manager = ConfigManager(MONITOR_CONFIG, self.server_name)
+        monitored_containers = [c for c in all_containers if config_manager.is_monitored(c)]
+        
         registry[self.server_name] = {
             'last_heartbeat': time.time(),
             'version': VERSION,
-            'is_primary': self.is_primary
+            'is_primary': self.is_primary,
+            'container_count': len(monitored_containers)
         }
         if safe_write_json(self.registry_file, registry):
             role = "主服务器 🌟" if self.is_primary else "从服务器"
-            logger.info(f"服务器已注册: {self.server_name} ({role})")
+            logger.info(f"服务器已注册: {self.server_name} ({role}) - 容器: {len(monitored_containers)}个")
         else:
             logger.error(f"服务器注册失败: {self.server_name}")
 
     def heartbeat(self):
         registry = safe_read_json(self.registry_file, default={})
         if self.server_name in registry:
+            # 更新容器数量信息
+            all_containers = DockerManager.get_all_containers()
+            config_manager = ConfigManager(MONITOR_CONFIG, self.server_name)
+            monitored_containers = [c for c in all_containers if config_manager.is_monitored(c)]
+            
             registry[self.server_name]['last_heartbeat'] = time.time()
             registry[self.server_name]['is_primary'] = self.is_primary
+            registry[self.server_name]['container_count'] = len(monitored_containers)
             safe_write_json(self.registry_file, registry)
 
     def get_active_servers(self) -> List[str]:
@@ -614,6 +627,57 @@ class CommandHandler:
         self.docker = docker
         self.config = config
         self.registry = registry
+
+    def handle_servers(self, chat_id: str):
+        """处理 /servers 命令 - 显示所有服务器状态概览"""
+        servers = self.registry.get_active_servers()
+        registry_data = safe_read_json(self.registry.registry_file, default={})
+        
+        if not servers:
+            self.bot.send_message("⚠️ 当前没有活跃的服务器")
+            return
+        
+        # 获取主服务器信息
+        primary_server = None
+        for server, info in registry_data.items():
+            if info.get('is_primary', False):
+                primary_server = server
+                break
+        
+        server_msg = f"🌐 <b>在线服务器 ({len(servers)})</b>\n\n"
+        
+        for server in servers:
+            server_info = registry_data.get(server, {})
+            
+            # 计算心跳时间
+            last_heartbeat = server_info.get('last_heartbeat', 0)
+            time_diff = time.time() - last_heartbeat
+            
+            if time_diff < 30:
+                time_text = "刚刚"
+            elif time_diff < 60:
+                time_text = f"{int(time_diff)}秒前"
+            else:
+                minutes = int(time_diff / 60)
+                time_text = f"{minutes}分钟前" if minutes < 60 else f"{int(minutes/60)}小时前"
+            
+            # 获取容器数量
+            container_count = server_info.get('container_count', 0)
+            
+            # 标记主服务器
+            server_display = server
+            is_primary = server_info.get('is_primary', False)
+            if is_primary:
+                server_display = f"{server} 🌟"
+            
+            server_msg += f"🖥️ <b>{server_display}</b> ({container_count}个容器)\n"
+            server_msg += f"   最后心跳: {time_text}\n\n"
+        
+        server_msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+        server_msg += f"💡 主服务器: <code>{primary_server if primary_server else '未设置'}</code>\n"
+        server_msg += f"⏰ 更新时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+        
+        self.bot.send_message(server_msg)
 
     def handle_status(self, chat_id: str):
         servers = self.registry.get_active_servers()
@@ -768,6 +832,7 @@ class CommandHandler:
 <b>可用命令：</b>
 
 /status - 查看服务器状态
+/servers - 查看所有服务器概览
 /update - 更新容器镜像
 /restart - 重启容器
 /monitor - 监控管理
@@ -1104,6 +1169,8 @@ class BotPoller(threading.Thread):
                 self.handler.handle_restart(chat_id)
             elif text.startswith('/monitor'):
                 self.handler.handle_monitor(chat_id)
+            elif text.startswith('/servers'):
+                self.handler.handle_servers(chat_id)
             elif text.startswith('/help') or text.startswith('/start'):
                 self.handler.handle_help()
         except Exception as e:
@@ -1448,6 +1515,7 @@ def main():
 
 🤖 <b>机器人功能</b>
    /status - 查看服务器状态
+   /servers - 查看所有服务器概览
    /update - 更新容器镜像
    /restart - 重启容器
    /monitor - 监控管理
@@ -1457,6 +1525,7 @@ def main():
    • 修复主服务器判断逻辑
    • 修复回调响应问题
    • 优化服务器协调机制
+   • 恢复 /servers 命令
 
 ⏰ <b>启动时间</b>
    <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
