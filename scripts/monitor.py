@@ -163,7 +163,6 @@ class CommandCoordinator:
         if action in non_server_callbacks:
             coordinator = self._get_coordinator()
             is_coordinator = (self.server_name == coordinator)
-            logger.info(f"回调 {action}: 协调者={coordinator}, 当前={self.server_name}, 处理={is_coordinator}")
             return is_coordinator
 
         if len(parts) >= 2:
@@ -176,19 +175,16 @@ class CommandCoordinator:
             if action in server_target_actions:
                 target_server = parts[1]
                 should_handle = (target_server == self.server_name)
-                logger.info(f"回调 {action} 目标: {target_server}, 当前: {self.server_name}, 处理: {should_handle}")
                 return should_handle
 
         coordinator = self._get_coordinator()
         is_coordinator = (self.server_name == coordinator)
-        logger.info(f"回调 {action} (默认): 协调者={coordinator}, 当前={self.server_name}, 处理={is_coordinator}")
         return is_coordinator
 
     def _get_coordinator(self) -> str:
         registry = safe_read_json(self.registry_file, default={})
         
         if not registry:
-            logger.debug(f"注册表为空，使用当前服务器: {self.server_name}")
             return self.server_name
         
         current_time = time.time()
@@ -199,33 +195,13 @@ class CommandCoordinator:
                 active_servers.append(server)
         
         if not active_servers:
-            logger.debug(f"没有活跃服务器，使用当前服务器: {self.server_name}")
             return self.server_name
         
         primary_servers = [s for s in active_servers if registry.get(s, {}).get('is_primary', False)]
         if primary_servers:
-            coordinator = primary_servers[0]
-            logger.debug(f"主服务器 {coordinator} 活跃，作为协调者")
-            return coordinator
+            return primary_servers[0]
         
-        coordinator = sorted(active_servers)[0]
-        logger.debug(f"无主服务器，使用备用协调者: {coordinator}")
-        return coordinator
-
-    def _get_active_servers(self) -> List[str]:
-        registry = safe_read_json(self.registry_file, default={})
-
-        if not registry:
-            return [self.server_name]
-
-        current_time = time.time()
-        active_servers = []
-
-        for server, info in registry.items():
-            if current_time - info.get('last_heartbeat', 0) < 90:
-                active_servers.append(server)
-
-        return sorted(active_servers) if active_servers else [self.server_name]
+        return sorted(active_servers)[0]
 
 class TelegramBot:
     def __init__(self, token: str, chat_id: str, server_name: str):
@@ -254,14 +230,13 @@ class TelegramBot:
                 )
 
                 if response.status_code == 200 and response.json().get('ok'):
-                    logger.info("✓ Telegram 消息发送成功")
                     return True
                 else:
                     error_desc = response.json().get('description', '未知错误')
-                    logger.error(f"✗ Telegram API 错误: {error_desc}")
+                    logger.error(f"Telegram API 错误: {error_desc}")
 
             except Exception as e:
-                logger.error(f"✗ 发送失败: {e}")
+                logger.error(f"发送失败: {e}")
 
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 5
@@ -291,11 +266,18 @@ class TelegramBot:
             logger.error(f"编辑消息失败: {e}")
             return False
 
-    def answer_callback(self, callback_query_id: str, text: str) -> bool:
+    def answer_callback(self, callback_query_id: str, text: str = "") -> bool:
         try:
+            payload = {
+                'callback_query_id': callback_query_id,
+                'show_alert': False
+            }
+            if text:
+                payload['text'] = text
+
             response = self.session.post(
                 f"{self.api_url}/answerCallbackQuery",
-                json={'callback_query_id': callback_query_id, 'text': text},
+                json=payload,
                 timeout=10
             )
             return response.status_code == 200
@@ -825,6 +807,8 @@ class CommandHandler:
 
         elif action == 'update_cnt':
             server, container = parts[1], parts[2]
+            self.bot.answer_callback(callback_query_id)
+            
             confirm_msg = f"""⚠️ <b>确认更新</b>
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -849,7 +833,6 @@ class CommandHandler:
                     [{'text': "❌ 取消", 'callback_data': "cancel"}]
                 ]
             }
-            self.bot.answer_callback(callback_query_id, "准备更新...")
             self.bot.edit_message(chat_id, message_id, confirm_msg, buttons)
 
         elif action == 'confirm_update':
@@ -907,6 +890,8 @@ class CommandHandler:
 
         elif action == 'restart_cnt':
             server, container = parts[1], parts[2]
+            self.bot.answer_callback(callback_query_id)
+            
             confirm_msg = f"""⚠️ <b>确认重启</b>
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -923,7 +908,6 @@ class CommandHandler:
                     [{'text': "❌ 取消", 'callback_data': "cancel"}]
                 ]
             }
-            self.bot.answer_callback(callback_query_id, "准备重启...")
             self.bot.edit_message(chat_id, message_id, confirm_msg, buttons)
 
         elif action == 'confirm_restart':
@@ -958,13 +942,13 @@ class CommandHandler:
 
         elif action == 'monitor_action':
             action_type = parts[1]
+            self.bot.answer_callback(callback_query_id)
+            
             if action_type == 'list':
-                self.bot.answer_callback(callback_query_id, "正在查看列表...")
                 self.handle_status(chat_id)
             else:
                 servers = self.registry.get_active_servers()
                 if len(servers) == 1:
-                    self.bot.answer_callback(callback_query_id, "正在加载...")
                     self._handle_monitor_server(
                         chat_id, message_id, action_type, servers[0]
                     )
@@ -977,7 +961,6 @@ class CommandHandler:
                         ]
                     }
                     action_text = "添加监控" if action_type == "add" else "移除监控"
-                    self.bot.answer_callback(callback_query_id, f"选择服务器...")
                     self.bot.edit_message(
                         chat_id, message_id,
                         f"📡 <b>{action_text}</b>\n\n请选择服务器：",
