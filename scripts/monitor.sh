@@ -1,1058 +1,1181 @@
-#!/bin/sh
-# Docker 容器监控通知服务 v4.0.1
-# 监控 Watchtower 日志并发送 Telegram 通知 + 机器人交互管理
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Docker 容器监控通知服务 v5.0.0
+支持多服务器管理、Telegram Bot 交互
+"""
 
-echo "正在安装依赖..."
-apk add --no-cache curl docker-cli coreutils grep sed tzdata jq >/dev/null 2>&1
+import os
+import sys
+import json
+import time
+import signal
+import subprocess
+import threading
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional, Set
+import requests
+from pathlib import Path
 
-TELEGRAM_API="https://api.telegram.org/bot${BOT_TOKEN}"
-STATE_FILE="/data/container_state.db"
-MONITOR_CONFIG="/data/monitor_config.json"
-TEMP_LOG="/tmp/watchtower_events.log"
-BOT_PID_FILE="/tmp/bot_handler.pid"
+# ==================== 配置和常量 ====================
 
-# 确保数据目录和配置文件存在
-mkdir -p /data
-[ ! -f "$MONITOR_CONFIG" ] && echo '{}' > "$MONITOR_CONFIG"
+VERSION = "5.0.0"
+TELEGRAM_API = f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN')}"
+CHAT_ID = os.getenv('CHAT_ID')
+SERVER_NAME = os.getenv('SERVER_NAME')
 
-# 验证 SERVER_NAME 是否设置
-if [ -z "$SERVER_NAME" ]; then
-    echo "错误: 必须设置 SERVER_NAME 环境变量"
-    exit 1
-fi
+# 文件路径
+DATA_DIR = Path("/data")
+STATE_FILE = DATA_DIR / "container_state.json"
+MONITOR_CONFIG = DATA_DIR / "monitor_config.json"
+SERVER_REGISTRY = DATA_DIR / "server_registry.json"
 
-SERVER_TAG="<b>[${SERVER_NAME}]</b> "
+# 确保数据目录存在
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# ==================== 通用函数 ====================
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
-send_telegram() {
-    message="$1"
-    reply_markup="$2"
-    max_retries=3
-    retry=0
-    wait_time=5
+# 全局变量
+shutdown_flag = threading.Event()
 
-    while [ $retry -lt $max_retries ]; do
-        if [ -n "$reply_markup" ]; then
-            response=$(curl -s -w "\n%{http_code}" -X POST "$TELEGRAM_API/sendMessage" \
-                --data-urlencode "chat_id=${CHAT_ID}" \
-                --data-urlencode "text=${SERVER_TAG}${message}" \
-                --data-urlencode "parse_mode=HTML" \
-                --data-urlencode "reply_markup=${reply_markup}" \
-                --connect-timeout 10 --max-time 30 2>&1)
-        else
-            response=$(curl -s -w "\n%{http_code}" -X POST "$TELEGRAM_API/sendMessage" \
-                --data-urlencode "chat_id=${CHAT_ID}" \
-                --data-urlencode "text=${SERVER_TAG}${message}" \
-                --data-urlencode "parse_mode=HTML" \
-                --connect-timeout 10 --max-time 30 2>&1)
-        fi
 
-        curl_exit_code=$?
-        http_code=$(echo "$response" | tail -n1)
-        body=$(echo "$response" | sed '$d')
+# ==================== 工具类 ====================
 
-        if [ $curl_exit_code -ne 0 ]; then
-            echo "  ✗ Curl 执行失败 (退出码: $curl_exit_code)" >&2
-        elif [ "$http_code" = "200" ]; then
-            if echo "$body" | grep -q '"ok":true'; then
-                echo "  ✓ Telegram 通知发送成功"
-                return 0
-            else
-                error_desc=$(echo "$body" | sed -n 's/.*"description":"\([^"]*\)".*/\1/p')
-                echo "  ✗ Telegram API 错误: ${error_desc:-未知错误}" >&2
-            fi
-        else
-            echo "  ✗ HTTP 请求失败 (状态码: $http_code)" >&2
-        fi
+class TelegramBot:
+    """Telegram Bot API 封装"""
+    
+    def __init__(self, token: str, chat_id: str, server_name: str):
+        self.api_url = f"https://api.telegram.org/bot{token}"
+        self.chat_id = chat_id
+        self.server_tag = f"<b>[{server_name}]</b> "
+        self.session = requests.Session()
+        self.session.headers.update({'Connection': 'keep-alive'})
+    
+    def send_message(self, text: str, reply_markup: Optional[Dict] = None, 
+                     max_retries: int = 3) -> bool:
+        """发送 Telegram 消息"""
+        for attempt in range(max_retries):
+            try:
+                payload = {
+                    'chat_id': self.chat_id,
+                    'text': self.server_tag + text,
+                    'parse_mode': 'HTML'
+                }
+                if reply_markup:
+                    payload['reply_markup'] = json.dumps(reply_markup)
+                
+                response = self.session.post(
+                    f"{self.api_url}/sendMessage",
+                    json=payload,
+                    timeout=30
+                )
+                
+                if response.status_code == 200 and response.json().get('ok'):
+                    logger.info("✓ Telegram 消息发送成功")
+                    return True
+                else:
+                    error_desc = response.json().get('description', '未知错误')
+                    logger.error(f"✗ Telegram API 错误: {error_desc}")
+                    
+            except Exception as e:
+                logger.error(f"✗ 发送失败: {e}")
+            
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 5
+                logger.info(f"↻ {wait_time}秒后重试 ({attempt + 1}/{max_retries})...")
+                time.sleep(wait_time)
+        
+        logger.error(f"✗ Telegram 消息最终失败 (已重试 {max_retries} 次)")
+        return False
+    
+    def edit_message(self, chat_id: str, message_id: str, text: str, 
+                     reply_markup: Optional[Dict] = None) -> bool:
+        """编辑消息"""
+        try:
+            payload = {
+                'chat_id': chat_id,
+                'message_id': message_id,
+                'text': text,
+                'parse_mode': 'HTML'
+            }
+            if reply_markup:
+                payload['reply_markup'] = json.dumps(reply_markup)
+            
+            response = self.session.post(
+                f"{self.api_url}/editMessageText",
+                json=payload,
+                timeout=30
+            )
+            return response.status_code == 200
+        except Exception as e:
+            logger.error(f"编辑消息失败: {e}")
+            return False
+    
+    def answer_callback(self, callback_query_id: str, text: str) -> bool:
+        """回应回调查询"""
+        try:
+            response = self.session.post(
+                f"{self.api_url}/answerCallbackQuery",
+                json={'callback_query_id': callback_query_id, 'text': text},
+                timeout=10
+            )
+            return response.status_code == 200
+        except Exception as e:
+            logger.error(f"回应回调失败: {e}")
+            return False
+    
+    def get_updates(self, offset: int = 0, timeout: int = 30) -> Optional[List]:
+        """获取更新"""
+        try:
+            response = self.session.post(
+                f"{self.api_url}/getUpdates",
+                json={'offset': offset, 'timeout': timeout},
+                timeout=timeout + 10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('ok'):
+                    return data.get('result', [])
+        except Exception as e:
+            logger.debug(f"获取更新失败: {e}")
+        return None
 
-        retry=$((retry + 1))
-        if [ $retry -lt $max_retries ]; then
-            echo "  ↻ ${wait_time}秒后重试 ($retry/$max_retries)..." >&2
-            sleep $wait_time
-            wait_time=$((wait_time * 2))
-        fi
-    done
 
-    echo "  ✗ Telegram 通知最终失败 (已重试 $max_retries 次)" >&2
-    return 1
-}
+class DockerManager:
+    """Docker 容器管理"""
+    
+    @staticmethod
+    def get_all_containers() -> List[str]:
+        """获取所有容器（排除监控相关容器）"""
+        try:
+            result = subprocess.run(
+                ['docker', 'ps', '--format', '{{.Names}}'],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                containers = result.stdout.strip().split('\n')
+                return [c for c in containers 
+                       if c and c not in ['watchtower', 'watchtower-notifier']]
+        except Exception as e:
+            logger.error(f"获取容器列表失败: {e}")
+        return []
+    
+    @staticmethod
+    def get_container_info(container: str) -> Dict:
+        """获取容器详细信息"""
+        try:
+            result = subprocess.run(
+                ['docker', 'inspect', container],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                if data:
+                    info = data[0]
+                    return {
+                        'name': container,
+                        'running': info['State']['Running'],
+                        'image': info['Config']['Image'],
+                        'image_id': info['Image'],
+                        'created': info['Created']
+                    }
+        except Exception as e:
+            logger.error(f"获取容器 {container} 信息失败: {e}")
+        return {}
+    
+    @staticmethod
+    def restart_container(container: str) -> bool:
+        """重启容器"""
+        try:
+            result = subprocess.run(
+                ['docker', 'restart', container],
+                capture_output=True, text=True, timeout=60
+            )
+            return result.returncode == 0
+        except Exception as e:
+            logger.error(f"重启容器 {container} 失败: {e}")
+            return False
+    
+    @staticmethod
+    def get_danmu_version(container: str) -> Optional[str]:
+        """获取 danmu-api 版本"""
+        if 'danmu' not in container.lower():
+            return None
+        
+        try:
+            # 等待容器就绪
+            for _ in range(30):
+                check = subprocess.run(
+                    ['docker', 'exec', container, 'test', '-f', 
+                     '/app/danmu_api/configs/globals.js'],
+                    capture_output=True, timeout=5
+                )
+                if check.returncode == 0:
+                    break
+                time.sleep(1)
+            
+            # 读取版本
+            result = subprocess.run(
+                ['docker', 'exec', container, 'cat', 
+                 '/app/danmu_api/configs/globals.js'],
+                capture_output=True, text=True, timeout=10
+            )
+            
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'VERSION:' in line:
+                        import re
+                        match = re.search(r"VERSION:\s*['\"]([^'\"]+)['\"]", line)
+                        if match:
+                            return match.group(1)
+        except Exception as e:
+            logger.debug(f"获取 danmu 版本失败: {e}")
+        
+        return None
 
-answer_callback() {
-    callback_query_id="$1"
-    text="$2"
 
-    curl -s -X POST "$TELEGRAM_API/answerCallbackQuery" \
-        --data-urlencode "callback_query_id=${callback_query_id}" \
-        --data-urlencode "text=${text}" \
-        --connect-timeout 5 --max-time 10 >/dev/null 2>&1
-}
+class ConfigManager:
+    """配置管理器"""
+    
+    def __init__(self, config_file: Path, server_name: str):
+        self.config_file = config_file
+        self.server_name = server_name
+        self.config = self._load_config()
+    
+    def _load_config(self) -> Dict:
+        """加载配置"""
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"加载配置失败: {e}")
+        return {}
+    
+    def _save_config(self):
+        """保存配置"""
+        try:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存配置失败: {e}")
+    
+    def get_excluded_containers(self, server: Optional[str] = None) -> Set[str]:
+        """获取排除的容器列表"""
+        server = server or self.server_name
+        return set(self.config.get(server, {}).get('excluded', []))
+    
+    def add_excluded(self, container: str, server: Optional[str] = None):
+        """添加到排除列表"""
+        server = server or self.server_name
+        if server not in self.config:
+            self.config[server] = {'excluded': []}
+        
+        excluded = set(self.config[server].get('excluded', []))
+        excluded.add(container)
+        self.config[server]['excluded'] = sorted(list(excluded))
+        self._save_config()
+    
+    def remove_excluded(self, container: str, server: Optional[str] = None):
+        """从排除列表移除"""
+        server = server or self.server_name
+        if server in self.config:
+            excluded = set(self.config[server].get('excluded', []))
+            excluded.discard(container)
+            self.config[server]['excluded'] = sorted(list(excluded))
+            self._save_config()
+    
+    def is_monitored(self, container: str, server: Optional[str] = None) -> bool:
+        """检查容器是否被监控"""
+        return container not in self.get_excluded_containers(server)
 
-edit_message() {
-    chat_id="$1"
-    message_id="$2"
-    new_text="$3"
-    reply_markup="$4"
 
-    if [ -n "$reply_markup" ]; then
-        curl -s -X POST "$TELEGRAM_API/editMessageText" \
-            --data-urlencode "chat_id=${chat_id}" \
-            --data-urlencode "message_id=${message_id}" \
-            --data-urlencode "text=${new_text}" \
-            --data-urlencode "parse_mode=HTML" \
-            --data-urlencode "reply_markup=${reply_markup}" \
-            --connect-timeout 10 --max-time 30 >/dev/null 2>&1
-    else
-        curl -s -X POST "$TELEGRAM_API/editMessageText" \
-            --data-urlencode "chat_id=${chat_id}" \
-            --data-urlencode "message_id=${message_id}" \
-            --data-urlencode "text=${new_text}" \
-            --data-urlencode "parse_mode=HTML" \
-            --connect-timeout 10 --max-time 30 >/dev/null 2>&1
-    fi
-}
-
-get_time() { date '+%Y-%m-%d %H:%M:%S'; }
-get_image_name() { echo "$1" | sed 's/:.*$//'; }
-get_short_id() { echo "$1" | sed 's/sha256://' | head -c 12 || echo "unknown"; }
-
-# ==================== 多服务器管理函数 ====================
-
-get_all_servers() {
-    jq -r 'keys[]' "$MONITOR_CONFIG" 2>/dev/null | sort || true
-}
-
-# ==================== 容器管理函数 ====================
-
-get_all_containers() {
-    docker ps --format '{{.Names}}' | grep -vE '^watchtower$|^watchtower-notifier$' || true
-}
-
-is_container_monitored() {
-    container="$1"
-    excluded=$(jq -r --arg srv "$SERVER_NAME" --arg cnt "$container" \
-        '.[$srv].excluded[]? | select(. == $cnt)' "$MONITOR_CONFIG" 2>/dev/null)
-
-    if [ -n "$excluded" ]; then
-        return 1
-    else
-        return 0
-    fi
-}
-
-add_to_excluded() {
-    server="$1"
-    container="$2"
-    jq --arg srv "$server" --arg cnt "$container" \
-        '.[$srv].excluded = ((.[$srv].excluded // []) + [$cnt] | unique)' \
-        "$MONITOR_CONFIG" > "${MONITOR_CONFIG}.tmp" && \
-        mv "${MONITOR_CONFIG}.tmp" "$MONITOR_CONFIG"
-}
-
-remove_from_excluded() {
-    server="$1"
-    container="$2"
-    jq --arg srv "$server" --arg cnt "$container" \
-        '.[$srv].excluded = ((.[$srv].excluded // []) - [$cnt])' \
-        "$MONITOR_CONFIG" > "${MONITOR_CONFIG}.tmp" && \
-        mv "${MONITOR_CONFIG}.tmp" "$MONITOR_CONFIG"
-}
-
-get_monitored_containers() {
-    for container in $(get_all_containers); do
-        if is_container_monitored "$container"; then
-            echo "$container"
-        fi
-    done
-}
-
-get_excluded_containers() {
-    jq -r --arg srv "$SERVER_NAME" '.[$srv].excluded[]?' "$MONITOR_CONFIG" 2>/dev/null || true
-}
-
-get_server_monitored_containers() {
-    server="$1"
-    # 这里需要远程获取容器列表,暂时返回配置中已知的容器
-    # 实际应用中需要实现跨服务器的容器查询
-    jq -r --arg srv "$server" '.[$srv].monitored[]?' "$MONITOR_CONFIG" 2>/dev/null || true
-}
-
-get_server_excluded_containers() {
-    server="$1"
-    jq -r --arg srv "$server" '.[$srv].excluded[]?' "$MONITOR_CONFIG" 2>/dev/null || true
-}
-
-# ==================== 版本管理函数 ====================
-
-get_danmu_version() {
-    container_name="$1"
-    check_running="${2:-true}"
-
-    if ! echo "$container_name" | grep -qE "danmu-api|danmu_api"; then
-        echo ""
-        return
-    fi
-
-    version=""
-
-    if [ "$check_running" = "true" ]; then
-        for i in $(seq 1 30); do
-            if docker exec "$container_name" test -f /app/danmu_api/configs/globals.js 2>/dev/null; then
-                break
-            fi
-            sleep 1
-        done
-    fi
-
-    version=$(docker exec "$container_name" cat /app/danmu_api/configs/globals.js 2>/dev/null | \
-              grep -m 1 "VERSION:" | sed -E "s/.*VERSION: '([^']+)'.*/\1/" 2>/dev/null || echo "")
-
-    if [ -z "$version" ]; then
-        image_id=$(docker inspect --format='{{.Image}}' "$container_name" 2>/dev/null)
-        if [ -n "$image_id" ] && [ "$image_id" != "sha256:unknown" ]; then
-            version=$(docker run --rm --entrypoint cat "$image_id" \
-                      /app/danmu_api/configs/globals.js 2>/dev/null | \
-                      grep -m 1 "VERSION:" | sed -E "s/.*VERSION: '([^']+)'.*/\1/" 2>/dev/null || echo "")
-        fi
-    fi
-
-    echo "$version"
-}
-
-format_version() {
-    img_tag="$1"
-    img_id="$2"
-    container_name="$3"
-
-    tag=$(echo "$img_tag" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
-    id_short=$(get_short_id "$img_id")
-
-    if echo "$container_name" | grep -qE "danmu-api|danmu_api"; then
-        real_version=$(get_danmu_version "$container_name")
-        if [ -n "$real_version" ]; then
-            echo "v${real_version} (${id_short})"
-            return
-        fi
-    fi
-
-    echo "$tag ($id_short)"
-}
-
-# ==================== 状态管理函数 ====================
-
-save_container_state() {
-    container="$1"
-    image_tag="$2"
-    image_id="$3"
-    version_info="$4"
-
-    if [ ! -f "$STATE_FILE" ]; then
-        touch "$STATE_FILE" || {
-            echo "  ✗ 无法创建状态文件" >&2
-            return 1
+class ServerRegistry:
+    """服务器注册中心 - 使用文件实现服务发现"""
+    
+    def __init__(self, registry_file: Path, server_name: str):
+        self.registry_file = registry_file
+        self.server_name = server_name
+        self.heartbeat_interval = 30  # 心跳间隔（秒）
+        self.timeout = 90  # 超时时间（秒）
+    
+    def register(self):
+        """注册当前服务器"""
+        registry = self._load_registry()
+        registry[self.server_name] = {
+            'last_heartbeat': time.time(),
+            'version': VERSION
         }
-    fi
+        self._save_registry(registry)
+        logger.info(f"服务器已注册: {self.server_name}")
+    
+    def heartbeat(self):
+        """发送心跳"""
+        registry = self._load_registry()
+        if self.server_name in registry:
+            registry[self.server_name]['last_heartbeat'] = time.time()
+            self._save_registry(registry)
+    
+    def get_active_servers(self) -> List[str]:
+        """获取活跃的服务器列表"""
+        registry = self._load_registry()
+        current_time = time.time()
+        active_servers = []
+        
+        for server, info in registry.items():
+            if current_time - info.get('last_heartbeat', 0) < self.timeout:
+                active_servers.append(server)
+        
+        return sorted(active_servers)
+    
+    def _load_registry(self) -> Dict:
+        """加载注册表"""
+        if self.registry_file.exists():
+            try:
+                with open(self.registry_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"加载注册表失败: {e}")
+        return {}
+    
+    def _save_registry(self, registry: Dict):
+        """保存注册表"""
+        try:
+            with open(self.registry_file, 'w', encoding='utf-8') as f:
+                json.dump(registry, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存注册表失败: {e}")
 
-    echo "$container|$image_tag|$image_id|$version_info|$(date +%s)" >> "$STATE_FILE"
-}
 
-get_container_state() {
-    container="$1"
+# ==================== 命令处理器 ====================
 
-    if [ ! -f "$STATE_FILE" ]; then
-        echo "unknown:tag|sha256:unknown|"
-        return
-    fi
-
-    state=$(grep "^${container}|" "$STATE_FILE" 2>/dev/null | tail -n 1)
-    if [ -z "$state" ]; then
-        echo "unknown:tag|sha256:unknown|"
-        return
-    fi
-
-    echo "$state" | cut -d'|' -f2,3,4
-}
-
-cleanup_old_states() {
-    if [ ! -f "$STATE_FILE" ]; then
-        return
-    fi
-
-    cutoff_time=$(( $(date +%s) - 604800 ))
-    temp_file="${STATE_FILE}.tmp"
-    : > "$temp_file"
-
-    if [ -s "$STATE_FILE" ]; then
-        while IFS='|' read -r container image_tag image_id version_info timestamp || [ -n "$container" ]; do
-            [ -z "$container" ] && continue
-            if echo "$timestamp" | grep -qE '^[0-9]+$' && [ "$timestamp" -ge "$cutoff_time" ]; then
-                echo "$container|$image_tag|$image_id|$version_info|$timestamp" >> "$temp_file"
-            fi
-        done < "$STATE_FILE"
-    fi
-
-    if [ -f "$temp_file" ]; then
-        mv "$temp_file" "$STATE_FILE" 2>/dev/null || rm -f "$temp_file"
-    fi
-}
-
-# ==================== 机器人命令处理 ====================
-
-handle_status_command() {
-    chat_id="$1"
-
-    monitored=$(get_monitored_containers | wc -l)
-    excluded=$(get_excluded_containers | wc -l)
-    total=$(get_all_containers | wc -l)
-
-    status_msg="📊 <b>服务器状态</b>
+class CommandHandler:
+    """命令处理器"""
+    
+    def __init__(self, bot: TelegramBot, docker: DockerManager, 
+                 config: ConfigManager, registry: ServerRegistry):
+        self.bot = bot
+        self.docker = docker
+        self.config = config
+        self.registry = registry
+    
+    def handle_status(self, chat_id: str):
+        """处理 /status 命令"""
+        all_containers = self.docker.get_all_containers()
+        monitored = [c for c in all_containers if self.config.is_monitored(c)]
+        excluded = self.config.get_excluded_containers()
+        
+        status_msg = f"""📊 <b>服务器状态</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 🖥️ <b>服务器信息</b>
-   名称: <code>${SERVER_NAME}</code>
-   时间: <code>$(get_time)</code>
+   名称: <code>{SERVER_NAME}</code>
+   时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
+   版本: <code>v{VERSION}</code>
 
 📦 <b>容器统计</b>
-   总计: <code>${total}</code>
-   监控中: <code>${monitored}</code>
-   已排除: <code>${excluded}</code>
+   总计: <code>{len(all_containers)}</code>
+   监控中: <code>{len(monitored)}</code>
+   已排除: <code>{len(excluded)}</code>
 
-🔍 <b>监控列表</b>"
-
-    if [ "$monitored" -eq 0 ]; then
-        status_msg="$status_msg
-   <i>暂无监控容器</i>"
-    else
-        for container in $(get_monitored_containers); do
-            status=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo "false")
-            if [ "$status" = "true" ]; then
-                status_icon="✅"
-            else
-                status_icon="❌"
-            fi
-
-            image_tag=$(docker inspect --format='{{.Config.Image}}' "$container" 2>/dev/null | sed 's/.*://')
-            status_msg="$status_msg
-   $status_icon <code>$container</code> [$image_tag]"
-        done
-    fi
-
-    if [ "$excluded" -gt 0 ]; then
-        status_msg="$status_msg
-
-🚫 <b>排除列表</b>"
-        for container in $(get_excluded_containers); do
-            status_msg="$status_msg
-   • <code>$container</code>"
-        done
-    fi
-
-    status_msg="$status_msg
-━━━━━━━━━━━━━━━━━━━━"
-
-    send_telegram "$status_msg"
-}
-
-handle_update_command() {
-    chat_id="$1"
-    
-    # 获取所有服务器
-    servers=$(get_all_servers)
-    
-    if [ -z "$servers" ]; then
-        send_telegram "⚠️ 没有可用的服务器"
-        return
-    fi
-    
-    server_count=$(echo "$servers" | wc -l)
-    
-    if [ "$server_count" -eq 1 ]; then
-        # 只有一个服务器,直接显示容器列表
-        handle_update_select_container "$chat_id" "$servers"
-    else
-        # 多个服务器,先选择服务器
-        buttons='{"inline_keyboard":['
-        first=true
-        for server in $servers; do
-            if [ "$first" = true ]; then
-                first=false
-            else
-                buttons="$buttons,"
-            fi
-            buttons="$buttons[{\"text\":\"🖥️ $server\",\"callback_data\":\"update_srv:$server\"}]"
-        done
-        buttons="$buttons"']}'
+🔍 <b>监控列表</b>"""
         
-        send_telegram "🔄 <b>选择要更新容器的服务器：</b>" "$buttons"
-    fi
-}
-
-handle_update_select_container() {
-    chat_id="$1"
-    server="$2"
-    
-    # 如果是当前服务器,直接获取容器列表
-    if [ "$server" = "$SERVER_NAME" ]; then
-        containers=$(get_monitored_containers)
-    else
-        # 其他服务器需要从配置中获取(实际应用需要远程查询)
-        containers=$(get_server_monitored_containers "$server")
-    fi
-    
-    if [ -z "$containers" ]; then
-        send_telegram "⚠️ 服务器 <code>$server</code> 没有可更新的容器"
-        return
-    fi
-    
-    buttons='{"inline_keyboard":['
-    first=true
-    for container in $containers; do
-        if [ "$first" = true ]; then
-            first=false
-        else
-            buttons="$buttons,"
-        fi
-        buttons="$buttons[{\"text\":\"📦 $container\",\"callback_data\":\"update_cnt:$server:$container\"}]"
-    done
-    buttons="$buttons"']}'
-    
-    send_telegram "🔄 <b>服务器 <code>$server</code></b>
-
-请选择要更新的容器：" "$buttons"
-}
-
-handle_restart_command() {
-    chat_id="$1"
-    
-    # 获取所有服务器
-    servers=$(get_all_servers)
-    
-    if [ -z "$servers" ]; then
-        send_telegram "⚠️ 没有可用的服务器"
-        return
-    fi
-    
-    server_count=$(echo "$servers" | wc -l)
-    
-    if [ "$server_count" -eq 1 ]; then
-        # 只有一个服务器,直接显示容器列表
-        handle_restart_select_container "$chat_id" "$servers"
-    else
-        # 多个服务器,先选择服务器
-        buttons='{"inline_keyboard":['
-        first=true
-        for server in $servers; do
-            if [ "$first" = true ]; then
-                first=false
-            else
-                buttons="$buttons,"
-            fi
-            buttons="$buttons[{\"text\":\"🖥️ $server\",\"callback_data\":\"restart_srv:$server\"}]"
-        done
-        buttons="$buttons"']}'
+        if not monitored:
+            status_msg += "\n   <i>暂无监控容器</i>"
+        else:
+            for container in monitored:
+                info = self.docker.get_container_info(container)
+                status_icon = "✅" if info.get('running') else "❌"
+                tag = info.get('image', '').split(':')[-1] or 'latest'
+                status_msg += f"\n   {status_icon} <code>{container}</code> [{tag}]"
         
-        send_telegram "🔄 <b>选择要重启容器的服务器：</b>" "$buttons"
-    fi
-}
-
-handle_restart_select_container() {
-    chat_id="$1"
-    server="$2"
-    
-    # 如果是当前服务器,直接获取容器列表
-    if [ "$server" = "$SERVER_NAME" ]; then
-        containers=$(get_all_containers)
-    else
-        # 其他服务器需要从配置中获取
-        containers=$(get_server_monitored_containers "$server")
-    fi
-    
-    if [ -z "$containers" ]; then
-        send_telegram "⚠️ 服务器 <code>$server</code> 没有可重启的容器"
-        return
-    fi
-    
-    buttons='{"inline_keyboard":['
-    first=true
-    for container in $containers; do
-        if [ "$first" = true ]; then
-            first=false
-        else
-            buttons="$buttons,"
-        fi
-        buttons="$buttons[{\"text\":\"🔄 $container\",\"callback_data\":\"restart_cnt:$server:$container\"}]"
-    done
-    buttons="$buttons"']}'
-    
-    send_telegram "🔄 <b>服务器 <code>$server</code></b>
-
-请选择要重启的容器：" "$buttons"
-}
-
-handle_monitor_command() {
-    chat_id="$1"
-
-    buttons='{"inline_keyboard":['
-    buttons="$buttons"'[{"text":"➕ 添加监控","callback_data":"monitor_action:add"}],'
-    buttons="$buttons"'[{"text":"➖ 移除监控","callback_data":"monitor_action:remove"}],'
-    buttons="$buttons"'[{"text":"📋 查看列表","callback_data":"monitor_action:list"}]'
-    buttons="$buttons"']}'
-
-    send_telegram "📡 <b>监控管理</b>
-
-请选择操作：" "$buttons"
-}
-
-handle_monitor_select_server() {
-    chat_id="$1"
-    message_id="$2"
-    action="$3"
-    
-    servers=$(get_all_servers)
-    
-    if [ -z "$servers" ]; then
-        edit_message "$chat_id" "$message_id" "⚠️ 没有可用的服务器"
-        return
-    fi
-    
-    server_count=$(echo "$servers" | wc -l)
-    
-    if [ "$server_count" -eq 1 ]; then
-        # 只有一个服务器,直接显示容器列表
-        if [ "$action" = "add" ]; then
-            handle_monitor_add_container "$chat_id" "$message_id" "$servers"
-        else
-            handle_monitor_remove_container "$chat_id" "$message_id" "$servers"
-        fi
-    else
-        # 多个服务器,先选择服务器
-        buttons='{"inline_keyboard":['
-        first=true
-        for server in $servers; do
-            if [ "$first" = true ]; then
-                first=false
-            else
-                buttons="$buttons,"
-            fi
-            buttons="$buttons[{\"text\":\"🖥️ $server\",\"callback_data\":\"monitor_srv:$action:$server\"}]"
-        done
-        buttons="$buttons"']}'
+        if excluded:
+            status_msg += "\n\n🚫 <b>排除列表</b>"
+            for container in sorted(excluded):
+                status_msg += f"\n   • <code>{container}</code>"
         
-        if [ "$action" = "add" ]; then
-            action_text="添加监控"
-        else
-            action_text="移除监控"
-        fi
+        status_msg += "\n━━━━━━━━━━━━━━━━━━━━"
+        self.bot.send_message(status_msg)
+    
+    def handle_update(self, chat_id: str):
+        """处理 /update 命令"""
+        servers = self.registry.get_active_servers()
         
-        edit_message "$chat_id" "$message_id" "📡 <b>${action_text}</b>
-
-请选择服务器：" "$buttons"
-    fi
-}
-
-handle_monitor_add_container() {
-    chat_id="$1"
-    message_id="$2"
-    server="$3"
+        if not servers:
+            self.bot.send_message("⚠️ 没有可用的服务器")
+            return
+        
+        if len(servers) == 1:
+            # 单服务器直接显示容器列表
+            self._show_update_containers(chat_id, servers[0])
+        else:
+            # 多服务器选择
+            buttons = {
+                'inline_keyboard': [
+                    [{'text': f"🖥️ {srv}", 'callback_data': f"update_srv:{srv}"}]
+                    for srv in servers
+                ]
+            }
+            self.bot.send_message("🔄 <b>选择要更新容器的服务器：</b>", buttons)
     
-    # 如果是当前服务器,直接获取排除列表
-    if [ "$server" = "$SERVER_NAME" ]; then
-        excluded=$(get_excluded_containers)
-    else
-        # 其他服务器从配置获取
-        excluded=$(get_server_excluded_containers "$server")
-    fi
+    def _show_update_containers(self, chat_id: str, server: str):
+        """显示可更新的容器列表"""
+        if server == SERVER_NAME:
+            containers = [c for c in self.docker.get_all_containers() 
+                         if self.config.is_monitored(c)]
+        else:
+            # 跨服务器操作需要提示
+            self.bot.send_message(
+                f"⚠️ 无法直接操作服务器 <code>{server}</code>\n"
+                f"请在对应服务器上执行操作"
+            )
+            return
+        
+        if not containers:
+            self.bot.send_message(f"⚠️ 服务器 <code>{server}</code> 没有可更新的容器")
+            return
+        
+        buttons = {
+            'inline_keyboard': [
+                [{'text': f"📦 {c}", 'callback_data': f"update_cnt:{server}:{c}"}]
+                for c in containers
+            ]
+        }
+        self.bot.send_message(
+            f"🔄 <b>服务器 <code>{server}</code></b>\n\n请选择要更新的容器：",
+            buttons
+        )
     
-    if [ -z "$excluded" ]; then
-        edit_message "$chat_id" "$message_id" "✅ 服务器 <code>$server</code> 所有容器都已在监控中"
-        return
-    fi
+    def handle_restart(self, chat_id: str):
+        """处理 /restart 命令"""
+        servers = self.registry.get_active_servers()
+        
+        if not servers:
+            self.bot.send_message("⚠️ 没有可用的服务器")
+            return
+        
+        if len(servers) == 1:
+            self._show_restart_containers(chat_id, servers[0])
+        else:
+            buttons = {
+                'inline_keyboard': [
+                    [{'text': f"🖥️ {srv}", 'callback_data': f"restart_srv:{srv}"}]
+                    for srv in servers
+                ]
+            }
+            self.bot.send_message("🔄 <b>选择要重启容器的服务器：</b>", buttons)
     
-    buttons='{"inline_keyboard":['
-    first=true
-    for container in $excluded; do
-        if [ "$first" = true ]; then
-            first=false
-        else
-            buttons="$buttons,"
-        fi
-        buttons="$buttons[{\"text\":\"➕ $container\",\"callback_data\":\"add_mon:$server:$container\"}]"
-    done
-    buttons="$buttons"']}'
+    def _show_restart_containers(self, chat_id: str, server: str):
+        """显示可重启的容器列表"""
+        if server == SERVER_NAME:
+            containers = self.docker.get_all_containers()
+        else:
+            self.bot.send_message(
+                f"⚠️ 无法直接操作服务器 <code>{server}</code>\n"
+                f"请在对应服务器上执行操作"
+            )
+            return
+        
+        if not containers:
+            self.bot.send_message(f"⚠️ 服务器 <code>{server}</code> 没有可重启的容器")
+            return
+        
+        buttons = {
+            'inline_keyboard': [
+                [{'text': f"🔄 {c}", 'callback_data': f"restart_cnt:{server}:{c}"}]
+                for c in containers
+            ]
+        }
+        self.bot.send_message(
+            f"🔄 <b>服务器 <code>{server}</code></b>\n\n请选择要重启的容器：",
+            buttons
+        )
     
-    edit_message "$chat_id" "$message_id" "📡 <b>添加监控</b>
-
-🖥️ 服务器: <code>$server</code>
-
-请选择要添加监控的容器：" "$buttons"
-}
-
-handle_monitor_remove_container() {
-    chat_id="$1"
-    message_id="$2"
-    server="$3"
+    def handle_monitor(self, chat_id: str):
+        """处理 /monitor 命令"""
+        buttons = {
+            'inline_keyboard': [
+                [{'text': "➕ 添加监控", 'callback_data': "monitor_action:add"}],
+                [{'text': "➖ 移除监控", 'callback_data': "monitor_action:remove"}],
+                [{'text': "📋 查看列表", 'callback_data': "monitor_action:list"}]
+            ]
+        }
+        self.bot.send_message("📡 <b>监控管理</b>\n\n请选择操作：", buttons)
     
-    # 如果是当前服务器,直接获取监控列表
-    if [ "$server" = "$SERVER_NAME" ]; then
-        monitored=$(get_monitored_containers)
-    else
-        # 其他服务器从配置获取
-        monitored=$(get_server_monitored_containers "$server")
-    fi
-    
-    if [ -z "$monitored" ]; then
-        edit_message "$chat_id" "$message_id" "⚠️ 服务器 <code>$server</code> 当前没有监控中的容器"
-        return
-    fi
-    
-    buttons='{"inline_keyboard":['
-    first=true
-    for container in $monitored; do
-        if [ "$first" = true ]; then
-            first=false
-        else
-            buttons="$buttons,"
-        fi
-        buttons="$buttons[{\"text\":\"➖ $container\",\"callback_data\":\"rem_mon:$server:$container\"}]"
-    done
-    buttons="$buttons"']}'
-    
-    edit_message "$chat_id" "$message_id" "📡 <b>移除监控</b>
-
-🖥️ 服务器: <code>$server</code>
-
-请选择要移除监控的容器：" "$buttons"
-}
-
-handle_help_command() {
-    help_msg="📖 <b>命令帮助</b>
+    def handle_help(self):
+        """处理 /help 命令"""
+        servers = self.registry.get_active_servers()
+        server_list = "\n".join([f"   • <code>{s}</code>" for s in servers])
+        
+        help_msg = f"""📖 <b>命令帮助</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 <b>可用命令：</b>
 
-/status
-  查看当前服务器状态和容器列表
+/status - 查看当前服务器状态
+/update - 更新容器镜像
+/restart - 重启容器
+/monitor - 监控管理
+/help - 显示此帮助信息
 
-/update
-  更新容器镜像
-  • 多服务器: 先选服务器,再选容器
-  • 单服务器: 直接选择容器
-
-/restart
-  重启容器
-  • 多服务器: 先选服务器,再选容器
-  • 单服务器: 直接选择容器
-
-/monitor
-  监控管理
-  • 添加监控: 将容器加入监控列表
-  • 移除监控: 从监控列表移除容器
-  • 查看列表: 显示监控状态
-
-/help
-  显示此帮助信息
 ━━━━━━━━━━━━━━━━━━━━
+<b>🌐 已连接服务器 ({len(servers)})：</b>
+{server_list if servers else '   <i>暂无服务器</i>'}
 
+━━━━━━━━━━━━━━━━━━━━
 💡 <b>使用提示：</b>
 
-• 所有操作都通过按钮选择,无需手动输入
-
-• 多服务器环境下会先让你选择服务器
-
-• 每条消息都会标注来源服务器名称
-
-• 所有危险操作都需要二次确认
-
-• 排除监控的容器不会收到更新通知
-
-• 使用 /status 随时查看当前服务器状态
-━━━━━━━━━━━━━━━━━━━━"
-
-    send_telegram "$help_msg"
-}
-
-# ==================== 回调处理 ====================
-
-handle_callback() {
-    callback_data="$1"
-    callback_query_id="$2"
-    chat_id="$3"
-    message_id="$4"
-
-    action=$(echo "$callback_data" | cut -d: -f1)
-    param1=$(echo "$callback_data" | cut -d: -f2)
-    param2=$(echo "$callback_data" | cut -d: -f3)
-    param3=$(echo "$callback_data" | cut -d: -f4)
-
-    case "$action" in
-        update_srv)
-            answer_callback "$callback_query_id" "正在加载容器列表..."
-            handle_update_select_container "$chat_id" "$param1"
-            ;;
+• 所有操作通过按钮选择
+• 多服务器会自动列出选项
+• 跨服务器操作需在目标服务器执行
+• 每条消息标注来源服务器
+• 使用 /status 查看实时状态
+━━━━━━━━━━━━━━━━━━━━"""
+        
+        self.bot.send_message(help_msg)
+    
+    def handle_callback(self, callback_data: str, callback_query_id: str, 
+                       chat_id: str, message_id: str):
+        """处理回调查询"""
+        parts = callback_data.split(':')
+        action = parts[0]
+        
+        if action == 'update_srv':
+            server = parts[1]
+            self.bot.answer_callback(callback_query_id, "正在加载容器列表...")
+            self._show_update_containers(chat_id, server)
+        
+        elif action == 'restart_srv':
+            server = parts[1]
+            self.bot.answer_callback(callback_query_id, "正在加载容器列表...")
+            self._show_restart_containers(chat_id, server)
+        
+        elif action == 'restart_cnt':
+            server, container = parts[1], parts[2]
+            if server != SERVER_NAME:
+                self.bot.answer_callback(callback_query_id, "无法操作其他服务器")
+                self.bot.edit_message(
+                    chat_id, message_id,
+                    f"❌ 当前服务器无法操作 <code>{server}</code> 的容器"
+                )
+                return
             
-        update_cnt)
-            server="$param1"
-            container="$param2"
-            answer_callback "$callback_query_id" "正在准备更新..."
-
-            confirm_msg="⚠️ <b>确认更新</b>
+            # 确认对话框
+            confirm_msg = f"""⚠️ <b>确认重启</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>$server</code>
-📦 容器: <code>$container</code>
-
-⚠️ 此操作将：
-   1. 拉取最新镜像
-   2. 停止当前容器
-   3. 启动新版本容器
+🖥️ 服务器: <code>{server}</code>
+📦 容器: <code>{container}</code>
 
 是否继续？
-━━━━━━━━━━━━━━━━━━━━"
-
-            buttons='{"inline_keyboard":['
-            buttons="${buttons}[{\"text\":\"✅ 确认更新\",\"callback_data\":\"confirm_update:${server}:${container}\"}],"
-            buttons="${buttons}[{\"text\":\"❌ 取消\",\"callback_data\":\"cancel\"}]"
-            buttons="${buttons}]}"
-
-            edit_message "$chat_id" "$message_id" "$confirm_msg" "$buttons"
-            ;;
-
-        confirm_update)
-            server="$param1"
-            container="$param2"
+━━━━━━━━━━━━━━━━━━━━"""
             
-            # 只有当前服务器才能执行更新
-            if [ "$server" != "$SERVER_NAME" ]; then
-                answer_callback "$callback_query_id" "无法操作其他服务器"
-                edit_message "$chat_id" "$message_id" "❌ 当前服务器无法操作 <code>$server</code> 的容器"
-                return
-            fi
+            buttons = {
+                'inline_keyboard': [
+                    [{'text': "✅ 确认重启", 
+                      'callback_data': f"confirm_restart:{server}:{container}"}],
+                    [{'text': "❌ 取消", 'callback_data': "cancel"}]
+                ]
+            }
+            self.bot.answer_callback(callback_query_id, "准备重启...")
+            self.bot.edit_message(chat_id, message_id, confirm_msg, buttons)
+        
+        elif action == 'confirm_restart':
+            server, container = parts[1], parts[2]
+            self.bot.answer_callback(callback_query_id, "开始重启容器...")
+            self.bot.edit_message(
+                chat_id, message_id,
+                f"⏳ 正在重启容器 <code>{container}</code>..."
+            )
             
-            answer_callback "$callback_query_id" "开始更新容器..."
-            edit_message "$chat_id" "$message_id" "⏳ 正在更新容器 <code>$container</code>，请稍候..."
-
-            # 执行更新
-            (
-                sleep 2
-                old_id=$(docker inspect --format='{{.Image}}' "$container" 2>/dev/null)
-                docker pull $(docker inspect --format='{{.Config.Image}}' "$container" 2>/dev/null) >/dev/null 2>&1
-                docker stop "$container" >/dev/null 2>&1
-                docker rm "$container" >/dev/null 2>&1
-
-                result_msg="✅ <b>更新完成</b>
+            # 执行重启
+            success = self.docker.restart_container(container)
+            
+            if success:
+                result_msg = f"""✅ <b>重启成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>$server</code>
-📦 容器: <code>$container</code>
-
-⚠️ 注意：
-容器已停止，请使用原启动命令重新创建容器
-
-💡 建议使用 docker-compose 或保存启动脚本
-━━━━━━━━━━━━━━━━━━━━"
-
-                edit_message "$chat_id" "$message_id" "$result_msg"
-            ) &
-            ;;
-
-        restart_srv)
-            answer_callback "$callback_query_id" "正在加载容器列表..."
-            handle_restart_select_container "$chat_id" "$param1"
-            ;;
-            
-        restart_cnt)
-            server="$param1"
-            container="$param2"
-            answer_callback "$callback_query_id" "正在准备重启..."
-
-            confirm_msg="⚠️ <b>确认重启</b>
+🖥️ 服务器: <code>{server}</code>
+📦 容器: <code>{container}</code>
+⏰ 时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
+━━━━━━━━━━━━━━━━━━━━"""
+            else:
+                result_msg = f"""❌ <b>重启失败</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>$server</code>
-📦 容器: <code>$container</code>
-
-是否继续？
-━━━━━━━━━━━━━━━━━━━━"
-
-            buttons='{"inline_keyboard":['
-            buttons="${buttons}[{\"text\":\"✅ 确认重启\",\"callback_data\":\"confirm_restart:${server}:${container}\"}],"
-            buttons="${buttons}[{\"text\":\"❌ 取消\",\"callback_data\":\"cancel\"}]"
-            buttons="${buttons}]}"
-
-            edit_message "$chat_id" "$message_id" "$confirm_msg" "$buttons"
-            ;;
-
-        confirm_restart)
-            server="$param1"
-            container="$param2"
-            
-            # 只有当前服务器才能执行重启
-            if [ "$server" != "$SERVER_NAME" ]; then
-                answer_callback "$callback_query_id" "无法操作其他服务器"
-                edit_message "$chat_id" "$message_id" "❌ 当前服务器无法操作 <code>$server</code> 的容器"
-                return
-            fi
-            
-            answer_callback "$callback_query_id" "开始重启容器..."
-            edit_message "$chat_id" "$message_id" "⏳ 正在重启容器 <code>$container</code>..."
-
-            if docker restart "$container" >/dev/null 2>&1; then
-                result_msg="✅ <b>重启成功</b>
-
-━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>$server</code>
-📦 容器: <code>$container</code>
-⏰ 时间: <code>$(get_time)</code>
-━━━━━━━━━━━━━━━━━━━━"
-            else
-                result_msg="❌ <b>重启失败</b>
-
-━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>$server</code>
-📦 容器: <code>$container</code>
+🖥️ 服务器: <code>{server}</code>
+📦 容器: <code>{container}</code>
 
 请检查容器状态
-━━━━━━━━━━━━━━━━━━━━"
-            fi
-
-            edit_message "$chat_id" "$message_id" "$result_msg"
-            ;;
-
-        monitor_action)
-            handle_monitor_select_server "$chat_id" "$message_id" "$param1"
-            ;;
+━━━━━━━━━━━━━━━━━━━━"""
             
-        monitor_srv)
-            action_type="$param1"
-            server="$param2"
-            answer_callback "$callback_query_id" "正在加载容器列表..."
-            
-            if [ "$action_type" = "add" ]; then
-                handle_monitor_add_container "$chat_id" "$message_id" "$server"
-            elif [ "$action_type" = "remove" ]; then
-                handle_monitor_remove_container "$chat_id" "$message_id" "$server"
-            else
-                handle_status_command "$chat_id"
-            fi
-            ;;
-
-        add_mon)
-            server="$param1"
-            container="$param2"
-            
-            # 只有当前服务器才能修改监控
-            if [ "$server" != "$SERVER_NAME" ]; then
-                answer_callback "$callback_query_id" "无法操作其他服务器"
-                edit_message "$chat_id" "$message_id" "❌ 当前服务器无法操作 <code>$server</code> 的监控配置"
+            self.bot.edit_message(chat_id, message_id, result_msg)
+        
+        elif action == 'monitor_action':
+            action_type = parts[1]
+            if action_type == 'list':
+                self.handle_status(chat_id)
+            else:
+                servers = self.registry.get_active_servers()
+                if len(servers) == 1:
+                    self._handle_monitor_server(
+                        chat_id, message_id, action_type, servers[0]
+                    )
+                else:
+                    buttons = {
+                        'inline_keyboard': [
+                            [{'text': f"🖥️ {srv}", 
+                              'callback_data': f"monitor_srv:{action_type}:{srv}"}]
+                            for srv in servers
+                        ]
+                    }
+                    action_text = "添加监控" if action_type == "add" else "移除监控"
+                    self.bot.edit_message(
+                        chat_id, message_id,
+                        f"📡 <b>{action_text}</b>\n\n请选择服务器：",
+                        buttons
+                    )
+        
+        elif action == 'monitor_srv':
+            action_type, server = parts[1], parts[2]
+            self.bot.answer_callback(callback_query_id, "正在加载容器列表...")
+            self._handle_monitor_server(chat_id, message_id, action_type, server)
+        
+        elif action == 'add_mon':
+            server, container = parts[1], parts[2]
+            if server != SERVER_NAME:
+                self.bot.answer_callback(callback_query_id, "无法操作其他服务器")
                 return
-            fi
             
-            remove_from_excluded "$server" "$container"
-            answer_callback "$callback_query_id" "已添加到监控列表"
-            edit_message "$chat_id" "$message_id" "✅ <b>添加成功</b>
+            self.config.remove_excluded(container)
+            self.bot.answer_callback(callback_query_id, "已添加到监控列表")
+            self.bot.edit_message(
+                chat_id, message_id,
+                f"""✅ <b>添加成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>$server</code>
-📦 容器: <code>$container</code>
+🖥️ 服务器: <code>{server}</code>
+📦 容器: <code>{container}</code>
 
 已将容器添加到监控列表
-━━━━━━━━━━━━━━━━━━━━"
-            ;;
-
-        rem_mon)
-            server="$param1"
-            container="$param2"
-            
-            # 只有当前服务器才能修改监控
-            if [ "$server" != "$SERVER_NAME" ]; then
-                answer_callback "$callback_query_id" "无法操作其他服务器"
-                edit_message "$chat_id" "$message_id" "❌ 当前服务器无法操作 <code>$server</code> 的监控配置"
+━━━━━━━━━━━━━━━━━━━━"""
+            )
+        
+        elif action == 'rem_mon':
+            server, container = parts[1], parts[2]
+            if server != SERVER_NAME:
+                self.bot.answer_callback(callback_query_id, "无法操作其他服务器")
                 return
-            fi
             
-            add_to_excluded "$server" "$container"
-            answer_callback "$callback_query_id" "已从监控列表移除"
-            edit_message "$chat_id" "$message_id" "✅ <b>移除成功</b>
+            self.config.add_excluded(container)
+            self.bot.answer_callback(callback_query_id, "已从监控列表移除")
+            self.bot.edit_message(
+                chat_id, message_id,
+                f"""✅ <b>移除成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>$server</code>
-📦 容器: <code>$container</code>
+🖥️ 服务器: <code>{server}</code>
+📦 容器: <code>{container}</code>
 
 已将容器从监控列表移除
-━━━━━━━━━━━━━━━━━━━━"
-            ;;
+━━━━━━━━━━━━━━━━━━━━"""
+            )
+        
+        elif action == 'cancel':
+            self.bot.answer_callback(callback_query_id, "已取消操作")
+            self.bot.edit_message(chat_id, message_id, "❌ 操作已取消")
+    
+    def _handle_monitor_server(self, chat_id: str, message_id: str, 
+                               action: str, server: str):
+        """处理监控服务器选择"""
+        if server != SERVER_NAME:
+            self.bot.edit_message(
+                chat_id, message_id,
+                f"⚠️ 无法直接操作服务器 <code>{server}</code>\n"
+                f"请在对应服务器上执行操作"
+            )
+            return
+        
+        if action == 'add':
+            excluded = self.config.get_excluded_containers()
+            if not excluded:
+                self.bot.edit_message(
+                    chat_id, message_id,
+                    f"✅ 服务器 <code>{server}</code> 所有容器都已在监控中"
+                )
+                return
+            
+            buttons = {
+                'inline_keyboard': [
+                    [{'text': f"➕ {c}", 'callback_data': f"add_mon:{server}:{c}"}]
+                    for c in sorted(excluded)
+                ]
+            }
+            self.bot.edit_message(
+                chat_id, message_id,
+                f"📡 <b>添加监控</b>\n\n🖥️ 服务器: <code>{server}</code>\n\n请选择要添加监控的容器：",
+                buttons
+            )
+        
+        else:  # remove
+            all_containers = self.docker.get_all_containers()
+            monitored = [c for c in all_containers if self.config.is_monitored(c)]
+            
+            if not monitored:
+                self.bot.edit_message(
+                    chat_id, message_id,
+                    f"⚠️ 服务器 <code>{server}</code> 当前没有监控中的容器"
+                )
+                return
+            
+            buttons = {
+                'inline_keyboard': [
+                    [{'text': f"➖ {c}", 'callback_data': f"rem_mon:{server}:{c}"}]
+                    for c in monitored
+                ]
+            }
+            self.bot.edit_message(
+                chat_id, message_id,
+                f"📡 <b>移除监控</b>\n\n🖥️ 服务器: <code>{server}</code>\n\n请选择要移除监控的容器：",
+                buttons
+            )
 
-        cancel)
-            answer_callback "$callback_query_id" "已取消操作"
-            edit_message "$chat_id" "$message_id" "❌ 操作已取消"
-            ;;
-    esac
-}
 
-# ==================== 机器人消息处理循环 ====================
+# ==================== Bot 轮询线程 ====================
 
-bot_handler() {
-    last_update_id=0
+class BotPoller(threading.Thread):
+    """Bot 消息轮询线程"""
+    
+    def __init__(self, handler: CommandHandler, bot: TelegramBot):
+        super().__init__(daemon=True)
+        self.handler = handler
+        self.bot = bot
+        self.last_update_id = 0
+    
+    def run(self):
+        """运行轮询"""
+        logger.info("Bot 轮询线程已启动")
+        
+        while not shutdown_flag.is_set():
+            try:
+                updates = self.bot.get_updates(self.last_update_id + 1)
+                
+                if not updates:
+                    continue
+                
+                for update in updates:
+                    self.last_update_id = update.get('update_id', self.last_update_id)
+                    
+                    # 处理命令消息
+                    message = update.get('message', {})
+                    text = message.get('text', '')
+                    chat_id = str(message.get('chat', {}).get('id', ''))
+                    
+                    if text and chat_id == CHAT_ID:
+                        self._handle_command(text, chat_id)
+                    
+                    # 处理回调查询
+                    callback_query = update.get('callback_query', {})
+                    if callback_query:
+                        self._handle_callback(callback_query)
+                
+            except Exception as e:
+                logger.error(f"轮询错误: {e}")
+                time.sleep(5)
+    
+    def _handle_command(self, text: str, chat_id: str):
+        """处理命令"""
+        try:
+            if text.startswith('/status'):
+                self.handler.handle_status(chat_id)
+            elif text.startswith('/update'):
+                self.handler.handle_update(chat_id)
+            elif text.startswith('/restart'):
+                self.handler.handle_restart(chat_id)
+            elif text.startswith('/monitor'):
+                self.handler.handle_monitor(chat_id)
+            elif text.startswith('/help') or text.startswith('/start'):
+                self.handler.handle_help()
+        except Exception as e:
+            logger.error(f"处理命令失败: {e}")
+    
+    def _handle_callback(self, callback_query: Dict):
+        """处理回调"""
+        try:
+            callback_data = callback_query.get('data', '')
+            callback_query_id = callback_query.get('id', '')
+            chat_id = str(callback_query.get('message', {}).get('chat', {}).get('id', ''))
+            message_id = str(callback_query.get('message', {}).get('message_id', ''))
+            
+            if chat_id == CHAT_ID:
+                self.handler.handle_callback(
+                    callback_data, callback_query_id, chat_id, message_id
+                )
+        except Exception as e:
+            logger.error(f"处理回调失败: {e}")
 
-    while true; do
-        updates=$(curl -s -X POST "$TELEGRAM_API/getUpdates" \
-            --data-urlencode "offset=$((last_update_id + 1))" \
-            --data-urlencode "timeout=30" \
-            --connect-timeout 35 --max-time 40 2>/dev/null)
 
-        if [ -z "$updates" ] || ! echo "$updates" | grep -q '"ok":true'; then
-            sleep 5
-            continue
-        fi
+# ==================== 心跳线程 ====================
 
-        result_count=$(echo "$updates" | jq '.result | length' 2>/dev/null || echo "0")
+class HeartbeatThread(threading.Thread):
+    """服务器心跳线程"""
+    
+    def __init__(self, registry: ServerRegistry):
+        super().__init__(daemon=True)
+        self.registry = registry
+    
+    def run(self):
+        """运行心跳"""
+        logger.info("心跳线程已启动")
+        
+        while not shutdown_flag.is_set():
+            try:
+                self.registry.heartbeat()
+                time.sleep(self.registry.heartbeat_interval)
+            except Exception as e:
+                logger.error(f"心跳错误: {e}")
+                time.sleep(5)
 
-        if [ "$result_count" -eq 0 ]; then
-            continue
-        fi
 
-        i=0
-        while [ $i -lt "$result_count" ]; do
-            update=$(echo "$updates" | jq ".result[$i]" 2>/dev/null)
-            update_id=$(echo "$update" | jq -r '.update_id' 2>/dev/null)
+# ==================== Watchtower 日志监控 ====================
 
-            if [ -n "$update_id" ] && [ "$update_id" != "null" ]; then
-                last_update_id=$update_id
-            fi
+class WatchtowerMonitor:
+    """Watchtower 日志监控"""
+    
+    def __init__(self, bot: TelegramBot, docker: DockerManager, 
+                 config: ConfigManager):
+        self.bot = bot
+        self.docker = docker
+        self.config = config
+        self.session_data = {}
+    
+    def start(self):
+        """开始监控"""
+        logger.info("开始监控 Watchtower 日志...")
+        
+        # 等待 Watchtower 启动
+        self._wait_for_watchtower()
+        
+        # 启动日志监控
+        try:
+            process = subprocess.Popen(
+                ['docker', 'logs', '-f', '--tail', '0', 'watchtower'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            
+            for line in iter(process.stdout.readline, ''):
+                if shutdown_flag.is_set():
+                    break
+                
+                line = line.strip()
+                if not line:
+                    continue
+                
+                logger.info(line)
+                self._process_log_line(line)
+            
+        except Exception as e:
+            logger.error(f"监控 Watchtower 日志失败: {e}")
+    
+    def _wait_for_watchtower(self):
+        """等待 Watchtower 启动"""
+        logger.info("正在等待 Watchtower 容器启动...")
+        
+        for _ in range(60):
+            try:
+                result = subprocess.run(
+                    ['docker', 'inspect', '-f', '{{.State.Running}}', 'watchtower'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0 and 'true' in result.stdout:
+                    logger.info("Watchtower 已启动")
+                    time.sleep(3)
+                    return
+            except Exception:
+                pass
+            time.sleep(2)
+        
+        logger.warning("Watchtower 启动超时，继续监控")
+    
+    def _process_log_line(self, line: str):
+        """处理日志行"""
+        try:
+            # 检测容器停止
+            if 'Stopping /' in line:
+                container = self._extract_container_name(line, 'Stopping /')
+                if container and self.config.is_monitored(container):
+                    logger.info(f"→ 捕获到停止: {container}")
+                    self._store_old_state(container)
+            
+            # 检测 Session 完成
+            elif 'Session done' in line:
+                import re
+                match = re.search(r'Updated=(\d+)', line)
+                if match:
+                    updated = int(match.group(1))
+                    logger.info(f"→ Session 完成: Updated={updated}")
+                    
+                    if updated > 0 and self.session_data:
+                        self._process_updates()
+            
+            # 检测严重错误
+            elif 'level=error' in line.lower() or 'level=fatal' in line.lower():
+                self._process_error(line)
+        
+        except Exception as e:
+            logger.error(f"处理日志行失败: {e}")
+    
+    def _extract_container_name(self, line: str, prefix: str) -> Optional[str]:
+        """从日志行提取容器名"""
+        try:
+            start = line.find(prefix)
+            if start != -1:
+                start += len(prefix)
+                end = line.find(' ', start)
+                if end == -1:
+                    end = len(line)
+                return line[start:end].strip()
+        except Exception:
+            pass
+        return None
+    
+    def _store_old_state(self, container: str):
+        """存储旧状态"""
+        try:
+            info = self.docker.get_container_info(container)
+            if info:
+                self.session_data[container] = {
+                    'image': info.get('image', 'unknown'),
+                    'image_id': info.get('image_id', 'unknown'),
+                    'version': self.docker.get_danmu_version(container)
+                }
+                logger.info(f"  → 已暂存 {container} 的旧信息")
+        except Exception as e:
+            logger.error(f"存储旧状态失败: {e}")
+    
+    def _process_updates(self):
+        """处理更新"""
+        logger.info(f"→ 发现 {len(self.session_data)} 个更新，开始处理...")
+        
+        for container, old_state in self.session_data.items():
+            try:
+                if not self.config.is_monitored(container):
+                    logger.info(f"→ {container} 已被排除，跳过处理")
+                    continue
+                
+                logger.info(f"→ 处理容器: {container}")
+                time.sleep(5)  # 等待容器启动
+                
+                # 等待容器运行
+                for _ in range(60):
+                    info = self.docker.get_container_info(container)
+                    if info.get('running'):
+                        logger.info("  → 容器已启动")
+                        time.sleep(5)
+                        break
+                    time.sleep(1)
+                
+                # 获取新状态
+                new_info = self.docker.get_container_info(container)
+                new_version = self.docker.get_danmu_version(container)
+                
+                # 格式化版本信息
+                old_ver = self._format_version(old_state, container)
+                new_ver = self._format_version({
+                    'image': new_info.get('image', 'unknown'),
+                    'image_id': new_info.get('image_id', 'unknown'),
+                    'version': new_version
+                }, container)
+                
+                # 发送通知
+                self._send_update_notification(
+                    container, 
+                    new_info.get('image', 'unknown').split(':')[0],
+                    old_ver, 
+                    new_ver,
+                    new_info.get('running', False)
+                )
+                
+            except Exception as e:
+                logger.error(f"处理容器 {container} 更新失败: {e}")
+        
+        self.session_data.clear()
+        logger.info("→ 所有更新处理完成")
+    
+    def _format_version(self, state: Dict, container: str) -> str:
+        """格式化版本信息"""
+        image_id = state.get('image_id', 'unknown')
+        id_short = image_id.replace('sha256:', '')[:12]
+        
+        if 'danmu' in container.lower() and state.get('version'):
+            return f"v{state['version']} ({id_short})"
+        else:
+            tag = state.get('image', 'unknown:latest').split(':')[-1]
+            return f"{tag} ({id_short})"
+    
+    def _send_update_notification(self, container: str, image: str, 
+                                   old_ver: str, new_ver: str, running: bool):
+        """发送更新通知"""
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        if running:
+            message = f"""✨ <b>容器更新成功</b>
 
-            # 处理命令消息
-            message=$(echo "$update" | jq -r '.message.text' 2>/dev/null)
-            chat_id=$(echo "$update" | jq -r '.message.chat.id' 2>/dev/null)
-            message_id=$(echo "$update" | jq -r '.message.message_id' 2>/dev/null)
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器名称</b>
+   <code>{container}</code>
 
-            if [ -n "$message" ] && [ "$message" != "null" ] && [ "$chat_id" = "$CHAT_ID" ]; then
-                case "$message" in
-                    /status*) handle_status_command "$chat_id" ;;
-                    /update*) handle_update_command "$chat_id" ;;
-                    /restart*) handle_restart_command "$chat_id" ;;
-                    /monitor*) handle_monitor_command "$chat_id" ;;
-                    /help*) handle_help_command ;;
-                    /start*) handle_help_command ;;
-                esac
-            fi
+🎯 <b>镜像信息</b>
+   <code>{image}</code>
 
-            # 处理回调
-            callback_query=$(echo "$update" | jq -r '.callback_query' 2>/dev/null)
-            if [ -n "$callback_query" ] && [ "$callback_query" != "null" ]; then
-                callback_data=$(echo "$callback_query" | jq -r '.data' 2>/dev/null)
-                callback_query_id=$(echo "$callback_query" | jq -r '.id' 2>/dev/null)
-                callback_chat_id=$(echo "$callback_query" | jq -r '.message.chat.id' 2>/dev/null)
-                callback_message_id=$(echo "$callback_query" | jq -r '.message.message_id' 2>/dev/null)
+🔄 <b>版本变更</b>
+   <code>{old_ver}</code>
+   ➜
+   <code>{new_ver}</code>
 
-                if [ "$callback_chat_id" = "$CHAT_ID" ]; then
-                    handle_callback "$callback_data" "$callback_query_id" "$callback_chat_id" "$callback_message_id"
-                fi
-            fi
+⏰ <b>更新时间</b>
+   <code>{current_time}</code>
+━━━━━━━━━━━━━━━━━━━━
 
-            i=$((i + 1))
-        done
+✅ 容器已成功启动并运行正常"""
+        else:
+            message = f"""❌ <b>容器启动失败</b>
 
-        sleep 1
-    done
-}
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器名称</b>
+   <code>{container}</code>
+
+🎯 <b>镜像信息</b>
+   <code>{image}</code>
+
+🔄 <b>版本变更</b>
+   旧: <code>{old_ver}</code>
+   新: <code>{new_ver}</code>
+
+⏰ <b>更新时间</b>
+   <code>{current_time}</code>
+━━━━━━━━━━━━━━━━━━━━
+
+⚠️ 更新后无法启动
+💡 检查: <code>docker logs {container}</code>"""
+        
+        logger.info("  → 发送通知...")
+        self.bot.send_message(message)
+    
+    def _process_error(self, line: str):
+        """处理错误日志"""
+        # 过滤常见的非关键错误
+        if any(keyword in line.lower() for keyword in 
+               ['skipping', 'already up to date', 'no new images', 
+                'connection refused', 'timeout']):
+            return
+        
+        # 提取容器名和错误信息
+        container = None
+        for pattern in ['container=', 'container:', 'container ']:
+            if pattern in line.lower():
+                try:
+                    start = line.lower().find(pattern) + len(pattern)
+                    end = line.find(' ', start)
+                    if end == -1:
+                        end = len(line)
+                    container = line[start:end].strip()
+                    break
+                except Exception:
+                    pass
+        
+        if container and container not in ['watchtower', 'watchtower-notifier']:
+            if self.config.is_monitored(container):
+                error_msg = line[:200]
+                self.bot.send_message(f"""⚠️ <b>Watchtower 严重错误</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>{container}</code>
+🔴 <b>错误</b>: <code>{error_msg}</code>
+🕐 <b>时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
+━━━━━━━━━━━━━━━━━━━━""")
+
 
 # ==================== 主程序 ====================
 
-echo "=========================================="
-echo "Docker 容器监控通知服务 v4.0.1"
-echo "服务器: ${SERVER_NAME}"
-echo "启动时间: $(get_time)"
-echo "机器人: 已启用"
-echo "=========================================="
-echo ""
-
-cleanup_old_states
-
-# 启动机器人处理程序
-echo "正在启动 Telegram 机器人..."
-bot_handler &
-BOT_PID=$!
-echo $BOT_PID > "$BOT_PID_FILE"
-echo "机器人已启动 (PID: $BOT_PID)"
-echo ""
-
-echo "正在等待 watchtower 容器完全启动..."
-while true; do
-    if docker inspect -f '{{.State.Running}}' watchtower 2>/dev/null | grep -q "true"; then
-        echo "Watchtower 已启动，准备监控日志"
-        break
-    else
-        sleep 2
-    fi
-done
-
-echo "正在初始化容器状态数据库..."
-for container in $(docker ps --format '{{.Names}}'); do
-    if [ "$container" = "watchtower" ] || [ "$container" = "watchtower-notifier" ]; then
-        continue
-    fi
-
-    image_tag=$(docker inspect --format='{{.Config.Image}}' "$container" 2>/dev/null || echo "unknown:tag")
-    image_id=$(docker inspect --format='{{.Image}}' "$container" 2>/dev/null || echo "sha256:unknown")
-    version_info=$(get_danmu_version "$container" "false")
-
-    save_container_state "$container" "$image_tag" "$image_id" "$version_info"
-
-    if [ -n "$version_info" ]; then
-        echo "  → 已保存 $container 的状态到数据库 (版本: v${version_info})"
-    else
-        echo "  → 已保存 $container 的状态到数据库"
-    fi
-done
-
-monitored_count=$(get_monitored_containers | wc -l)
-excluded_count=$(get_excluded_containers | wc -l)
-total_count=$(get_all_containers | wc -l)
-
-echo "初始化完成，总计 ${total_count} 个容器 (监控: ${monitored_count}, 排除: ${excluded_count})"
-
-sleep 3
-
-monitored_containers=$(docker exec watchtower ps aux 2>/dev/null | \
-    grep "watchtower" | \
-    grep -v "grep" | \
-    sed 's/.*watchtower//' | \
-    tr ' ' '\n' | \
-    grep -v "^$" | \
-    grep -v "^--" | \
-    tail -n +2 || true)
-
-if [ -z "$monitored_containers" ]; then
-    monitored_containers=$(docker container inspect watchtower --format='{{range .Args}}{{println .}}{{end}}' 2>/dev/null | \
-        grep -v "^--" | \
-        grep -v "^$" || true)
-fi
-
-if [ -n "$monitored_containers" ]; then
-    container_count=$(echo "$monitored_containers" | wc -l)
-    monitor_list="<b>Watchtower 监控:</b>"
-    for c in $monitored_containers; do
-        monitor_list="$monitor_list
-   • <code>$c</code>"
-    done
-else
-    container_count=$(docker ps --format '{{.Names}}' | grep -vE "^watchtower$|^watchtower-notifier$" | wc -l)
-    monitor_list="<b>Watchtower 监控:</b> 全部容器"
-fi
-
-startup_message="🚀 <b>监控服务启动成功</b>
+def main():
+    """主程序入口"""
+    # 验证环境变量
+    if not SERVER_NAME:
+        logger.error("错误: 必须设置 SERVER_NAME 环境变量")
+        sys.exit(1)
+    
+    if not CHAT_ID or not os.getenv('BOT_TOKEN'):
+        logger.error("错误: 必须设置 BOT_TOKEN 和 CHAT_ID 环境变量")
+        sys.exit(1)
+    
+    # 打印启动信息
+    print("=" * 50)
+    print(f"Docker 容器监控通知服务 v{VERSION}")
+    print(f"服务器: {SERVER_NAME}")
+    print(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Python 版本: {sys.version.split()[0]}")
+    print("=" * 50)
+    print()
+    
+    # 初始化组件
+    bot = TelegramBot(os.getenv('BOT_TOKEN'), CHAT_ID, SERVER_NAME)
+    docker = DockerManager()
+    config = ConfigManager(MONITOR_CONFIG, SERVER_NAME)
+    registry = ServerRegistry(SERVER_REGISTRY, SERVER_NAME)
+    
+    # 注册服务器
+    registry.register()
+    
+    # 初始化命令处理器
+    handler = CommandHandler(bot, docker, config, registry)
+    
+    # 启动 Bot 轮询线程
+    bot_poller = BotPoller(handler, bot)
+    bot_poller.start()
+    logger.info(f"Bot 轮询线程已启动")
+    
+    # 启动心跳线程
+    heartbeat = HeartbeatThread(registry)
+    heartbeat.start()
+    logger.info(f"心跳线程已启动")
+    
+    # 获取容器统计信息
+    all_containers = docker.get_all_containers()
+    monitored = [c for c in all_containers if config.is_monitored(c)]
+    excluded = config.get_excluded_containers()
+    
+    logger.info(f"总容器: {len(all_containers)}, 监控: {len(monitored)}, 排除: {len(excluded)}")
+    
+    # 发送启动通知
+    servers = registry.get_active_servers()
+    server_list = "\n".join([f"   • <code>{s}</code>" for s in servers])
+    
+    startup_msg = f"""🚀 <b>监控服务启动成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📊 <b>服务信息</b>
-   版本: <code>v4.0.1</code>
-   服务器: <code>${SERVER_NAME}</code>
+   版本: <code>v{VERSION}</code>
+   服务器: <code>{SERVER_NAME}</code>
+   语言: <code>Python {sys.version.split()[0]}</code>
 
 🎯 <b>监控状态</b>
-   总容器: <code>${total_count}</code>
-   监控中: <code>${monitored_count}</code>
-   已排除: <code>${excluded_count}</code>
+   总容器: <code>{len(all_containers)}</code>
+   监控中: <code>{len(monitored)}</code>
+   已排除: <code>{len(excluded)}</code>
 
-${monitor_list}
+🌐 <b>已连接服务器 ({len(servers)})</b>
+{server_list}
 
 🤖 <b>机器人功能</b>
    /status - 查看状态
@@ -1061,234 +1184,41 @@ ${monitor_list}
    /monitor - 监控管理
    /help - 显示帮助
 
-💡 <b>使用说明</b>
-   • 所有命令无需参数
-   • 多服务器自动选择
-   • 按钮操作更安全
+💡 <b>新特性</b>
+   • Python 实现，更稳定
+   • 真正的多服务器支持
+   • 自动服务发现
+   • 更好的错误处理
 
 ⏰ <b>启动时间</b>
-   <code>$(get_time)</code>
+   <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
 ━━━━━━━━━━━━━━━━━━━━
 
-✅ 服务正常运行中"
+✅ 服务正常运行中"""
+    
+    bot.send_message(startup_msg)
+    
+    # 设置信号处理
+    def signal_handler(signum, frame):
+        logger.info("收到退出信号，正在关闭...")
+        shutdown_flag.set()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # 启动 Watchtower 监控
+    monitor = WatchtowerMonitor(bot, docker, config)
+    try:
+        monitor.start()
+    except KeyboardInterrupt:
+        logger.info("用户中断")
+    except Exception as e:
+        logger.error(f"监控异常: {e}")
+    finally:
+        shutdown_flag.set()
+        logger.info("服务已停止")
 
-send_telegram "$startup_message"
 
-echo "开始监控 Watchtower 日志..."
-
-cleanup() {
-    echo "收到退出信号，正在清理..."
-    if [ -f "$BOT_PID_FILE" ]; then
-        bot_pid=$(cat "$BOT_PID_FILE")
-        kill $bot_pid 2>/dev/null || true
-        rm -f "$BOT_PID_FILE"
-    fi
-    rm -f /tmp/session_data.txt
-    exit 0
-}
-
-trap cleanup INT TERM
-
-# 主循环 - 监控 Watchtower 日志
-docker logs -f --tail 0 watchtower 2>&1 | while IFS= read -r line; do
-    echo "[$(date '+%H:%M:%S')] $line"
-
-    if echo "$line" | grep -q "Stopping /"; then
-        container_name=$(echo "$line" | sed -n 's/.*Stopping \/\([^ ]*\).*/\1/p' | head -n1)
-        if [ -n "$container_name" ]; then
-            # 检查容器是否在监控列表中
-            if ! is_container_monitored "$container_name"; then
-                echo "[$(date '+%H:%M:%S')] → $container_name 已被排除，跳过通知"
-                continue
-            fi
-
-            echo "[$(date '+%H:%M:%S')] → 捕获到停止: $container_name"
-
-            old_state=$(get_container_state "$container_name")
-            old_image_tag=$(echo "$old_state" | cut -d'|' -f1)
-            old_image_id=$(echo "$old_state" | cut -d'|' -f2)
-            old_version_info=$(echo "$old_state" | cut -d'|' -f3)
-
-            echo "${container_name}|${old_image_tag}|${old_image_id}|${old_version_info}" >> /tmp/session_data.txt
-
-            if [ -n "$old_version_info" ]; then
-                echo "[$(date '+%H:%M:%S')]   → 已暂存旧信息: $old_image_tag ($old_image_id) v${old_version_info}"
-            else
-                echo "[$(date '+%H:%M:%S')]   → 已暂存旧信息: $old_image_tag ($old_image_id)"
-            fi
-        fi
-    fi
-
-    if echo "$line" | grep -q "Session done"; then
-        updated=$(echo "$line" | grep -oP '(?<=Updated=)[0-9]+' || echo "0")
-
-        echo "[$(date '+%H:%M:%S')] → Session 完成: Updated=$updated"
-
-        if [ "$updated" -gt 0 ] && [ -f /tmp/session_data.txt ]; then
-            echo "[$(date '+%H:%M:%S')] → 发现 ${updated} 处更新，立即处理..."
-
-            echo "[$(date '+%H:%M:%S')] → 会话数据:"
-            while IFS='|' read -r c_name old_tag old_id old_ver; do
-                echo "[$(date '+%H:%M:%S')]     $c_name | $old_tag"
-            done < /tmp/session_data.txt
-
-            while IFS='|' read -r container_name old_tag_full old_id_full old_version_info; do
-                [ -z "$container_name" ] && continue
-
-                # 再次检查是否在监控列表中
-                if ! is_container_monitored "$container_name"; then
-                    echo "[$(date '+%H:%M:%S')] → $container_name 已被排除，跳过处理"
-                    continue
-                fi
-
-                echo "[$(date '+%H:%M:%S')] → 处理容器: $container_name"
-                echo "[$(date '+%H:%M:%S')]   → 等待容器更新完成..."
-                sleep 5
-
-                for i in $(seq 1 60); do
-                    status=$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || echo "false")
-                    if [ "$status" = "true" ]; then
-                        echo "[$(date '+%H:%M:%S')]   → 容器已启动"
-                        sleep 5
-                        break
-                    fi
-                    sleep 1
-                done
-
-                status=$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || echo "false")
-                new_tag_full=$(docker inspect --format='{{.Config.Image}}' "$container_name" 2>/dev/null || echo "unknown:tag")
-                new_id_full=$(docker inspect --format='{{.Image}}' "$container_name" 2>/dev/null || echo "sha256:unknown")
-
-                new_version_info=""
-                if echo "$container_name" | grep -qE "danmu-api|danmu_api"; then
-                    if [ "$status" = "true" ]; then
-                        echo "[$(date '+%H:%M:%S')]   → 读取 danmu-api 版本..."
-                        for retry in 1 2; do
-                            for i in $(seq 1 30); do
-                                if docker exec "$container_name" test -f /app/danmu_api/configs/globals.js 2>/dev/null; then
-                                    break
-                                fi
-                                sleep 1
-                            done
-
-                            new_version_info=$(docker exec "$container_name" cat /app/danmu_api/configs/globals.js 2>/dev/null | \
-                                             grep -m 1 "VERSION:" | sed -E "s/.*VERSION: '([^']+)'.*/\1/" 2>/dev/null || echo "")
-
-                            if [ -n "$new_version_info" ]; then
-                                echo "[$(date '+%H:%M:%S')]   → 检测到版本: v${new_version_info}"
-                                break
-                            elif [ $retry -eq 1 ]; then
-                                echo "[$(date '+%H:%M:%S')]   → 首次读取失败，5秒后重试..."
-                                sleep 5
-                            fi
-                        done
-                    fi
-                fi
-
-                echo "$container_name|$new_tag_full|$new_id_full|$new_version_info|$(date +%s)" >> "$STATE_FILE"
-
-                img_name=$(echo "$new_tag_full" | sed 's/:.*$//')
-                time=$(date '+%Y-%m-%d %H:%M:%S')
-
-                old_tag=$(echo "$old_tag_full" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
-                new_tag=$(echo "$new_tag_full" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
-                old_id_short=$(echo "$old_id_full" | sed 's/sha256://' | head -c 12)
-                new_id_short=$(echo "$new_id_full" | sed 's/sha256://' | head -c 12)
-
-                if [ -n "$old_version_info" ]; then
-                    old_ver_display="v${old_version_info} (${old_id_short})"
-                else
-                    old_ver_display="$old_tag ($old_id_short)"
-                fi
-
-                if [ -n "$new_version_info" ]; then
-                    new_ver_display="v${new_version_info} (${new_id_short})"
-                else
-                    new_ver_display="$new_tag ($new_id_short)"
-                fi
-
-                if [ "$status" = "true" ]; then
-                    message="✨ <b>容器更新成功</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 <b>容器名称</b>
-   <code>${container_name}</code>
-
-🎯 <b>镜像信息</b>
-   <code>${img_name}</code>
-
-🔄 <b>版本变更</b>
-   <code>${old_ver_display}</code>
-   ➜
-   <code>${new_ver_display}</code>
-
-⏰ <b>更新时间</b>
-   <code>${time}</code>
-━━━━━━━━━━━━━━━━━━━━
-
-✅ 容器已成功启动并运行正常"
-
-                    echo "[$(date '+%H:%M:%S')]   → 发送成功通知..."
-                else
-                    message="❌ <b>容器启动失败</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 <b>容器名称</b>
-   <code>${container_name}</code>
-
-🎯 <b>镜像信息</b>
-   <code>${img_name}</code>
-
-🔄 <b>版本变更</b>
-   旧: <code>${old_ver_display}</code>
-   新: <code>${new_ver_display}</code>
-
-⏰ <b>更新时间</b>
-   <code>${time}</code>
-━━━━━━━━━━━━━━━━━━━━
-
-⚠️ 更新后无法启动
-💡 检查: <code>docker logs ${container_name}</code>"
-
-                    echo "[$(date '+%H:%M:%S')]   → 发送失败通知..."
-                fi
-
-                send_telegram "$message"
-
-            done < /tmp/session_data.txt
-
-            rm -f /tmp/session_data.txt
-            echo "[$(date '+%H:%M:%S')] → 所有通知已处理完成"
-
-        elif [ "$updated" -eq 0 ]; then
-            rm -f /tmp/session_data.txt 2>/dev/null
-        fi
-    fi
-
-    if echo "$line" | grep -qiE "level=error.*fatal|level=fatal"; then
-        if echo "$line" | grep -qiE "Skipping|Already up to date|No new images|connection refused.*timeout"; then
-            continue
-        fi
-
-        container_name=$(echo "$line" | sed -n 's/.*container[=: ]\+\([a-zA-Z0-9_.\-]\+\).*/\1/p' | head -n1)
-
-        error=$(echo "$line" | sed -n 's/.*msg="\([^"]*\)".*/\1/p' | head -c 200)
-        [ -z "$error" ] && error=$(echo "$line" | grep -oE "error=.*" | head -c 200)
-        [ -z "$error" ] && error=$(echo "$line" | head -c 200)
-
-        if [ -n "$container_name" ] && [ "$container_name" != "watchtower" ] && [ "$container_name" != "watchtower-notifier" ]; then
-            # 检查容器是否在监控列表中
-            if is_container_monitored "$container_name"; then
-                send_telegram "⚠️ <b>Watchtower 严重错误</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 <b>容器</b>: <code>$container_name</code>
-🔴 <b>错误</b>: <code>$error</code>
-🕐 <b>时间</b>: <code>$(get_time)</code>
-━━━━━━━━━━━━━━━━━━━━"
-            fi
-        fi
-    fi
-done
-
-cleanup
+if __name__ == "__main__":
+    main()
