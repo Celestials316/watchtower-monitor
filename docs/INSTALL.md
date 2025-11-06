@@ -1,19 +1,15 @@
 # 安装指南
 
-本文档提供详细的安装步骤、配置说明和故障排查方法。
+本文档提供详细的安装步骤、多服务器配置和故障排查方法。
 
 ## 📋 目录
 
 - [前置要求](#前置要求)
-- [安装方式](#安装方式)
-  - [方式 1: Docker Compose (推荐)](#方式-1-docker-compose-推荐)
-  - [方式 2: Docker Run](#方式-2-docker-run)
-  - [方式 3: 从源码构建](#方式-3-从源码构建)
-- [获取 Telegram 凭证](#️-获取-telegram-凭证)
-- [配置说明](#配置说明)
+- [单服务器部署](#单服务器部署)
+- [多服务器部署](#多服务器部署)
+- [获取 Telegram 凭证](#获取-telegram-凭证)
 - [验证安装](#验证安装)
-- [故障排查](#-故障排查)
-- [高级配置](#高级配置)
+- [故障排查](#故障排查)
 
 ---
 
@@ -21,77 +17,47 @@
 
 ### 系统要求
 
-- **操作系统**: Linux (推荐 Ubuntu 20.04+, Debian 11+, CentOS 8+)
+- **操作系统**: Linux (Ubuntu 20.04+, Debian 11+, CentOS 8+)
 - **架构**: amd64, arm64, arm/v7
-- **内存**: 最低 512MB，推荐 1GB+
-- **磁盘**: 最低 100MB 可用空间
+- **内存**: 最低 512MB
+- **磁盘**: 最低 100MB
 
 ### 软件要求
 
-1. **Docker**
-   ```bash
-   # 检查 Docker 版本（需要 20.10+）
-   docker --version
-   
-   # 如果未安装，运行安装脚本
-   curl -fsSL https://get.docker.com | sh
-   sudo usermod -aG docker $USER
-   newgrp docker
-   ```
+```bash
+# 检查 Docker 版本（需要 20.10+）
+docker --version
 
-2. **Docker Compose**
-   ```bash
-   # 检查版本（需要 v2.0+）
-   docker compose version
-   
-   # 如果提示命令不存在，安装 Docker Compose
-   # 方法 1: 使用 Docker 插件（推荐）
-   sudo apt-get update
-   sudo apt-get install docker-compose-plugin
-   
-   # 方法 2: 独立安装
-   sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-   sudo chmod +x /usr/local/bin/docker-compose
-   ```
+# 如果未安装
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+newgrp docker
 
-3. **基础工具**
-   ```bash
-   # Ubuntu/Debian
-   sudo apt-get install curl wget nano
-   
-   # CentOS/RHEL
-   sudo yum install curl wget nano
-   ```
+# 检查 Docker Compose（需要 v2.0+）
+docker compose version
+
+# 如果未安装
+sudo apt-get install docker-compose-plugin
+```
 
 ---
 
-## 安装方式
+## 单服务器部署
 
-### 方式 1: Docker Compose (推荐)
-
-这是最简单、最推荐的安装方式。
-
-#### 步骤 1: 创建工作目录
+### 步骤 1: 创建工作目录
 
 ```bash
-# 创建目录
 mkdir -p ~/watchtower && cd ~/watchtower
-
-# 或使用自定义路径
-mkdir -p /opt/watchtower && cd /opt/watchtower
 ```
 
-#### 步骤 2: 下载配置文件
+### 步骤 2: 下载配置文件
 
 ```bash
 # 下载 docker-compose.yml
 curl -o docker-compose.yml https://raw.githubusercontent.com/Celestials316/watchtower-telegram-monitor/main/docker/docker-compose.yml
-
-# 如果 GitHub 访问较慢，使用代理或手动创建（见下方）
 ```
 
-<details>
-<summary>📄 手动创建 docker-compose.yml（点击展开）</summary>
+或手动创建 `docker-compose.yml`：
 
 ```yaml
 services:
@@ -103,30 +69,11 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
     environment:
-      - WATCHTOWER_NOTIFICATIONS=
       - WATCHTOWER_NO_STARTUP_MESSAGE=true
       - TZ=Asia/Shanghai
       - WATCHTOWER_CLEANUP=${CLEANUP:-true}
-      - WATCHTOWER_INCLUDE_RESTARTING=true
-      - WATCHTOWER_INCLUDE_STOPPED=false
-      - WATCHTOWER_NO_RESTART=false
-      - WATCHTOWER_TIMEOUT=10s
       - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-3600}
-      - WATCHTOWER_DEBUG=false
-      - WATCHTOWER_LOG_LEVEL=info
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    healthcheck:
-      test: ["CMD", "sh", "-c", "ps aux | grep -v grep | grep -q watchtower"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
 
@@ -136,8 +83,7 @@ services:
     restart: unless-stopped
     network_mode: host
     depends_on:
-      watchtower:
-        condition: service_started
+      - watchtower
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./data:/data
@@ -145,279 +91,502 @@ services:
       - .env
     environment:
       - TZ=Asia/Shanghai
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
 ```
 
-将上述内容保存为 `docker-compose.yml`
-</details>
-
-#### 步骤 3: 创建环境变量文件
+### 步骤 3: 创建环境变量文件
 
 ```bash
-# 创建 .env 文件
 cat > .env << 'EOF'
-# ========================================
-# Docker 容器监控配置
-# ========================================
+# Telegram 配置（必填）
+BOT_TOKEN=你的_bot_token
+CHAT_ID=你的_chat_id
 
-# ----- Telegram 配置 (必填) -----
-BOT_TOKEN=你的_bot_token_这里替换
-CHAT_ID=你的_chat_id_这里替换
+# 服务器名称（可选）
+SERVER_NAME=我的服务器
 
-# ----- 服务器配置 (可选) -----
-# 用于区分不同服务器的通知，会显示为 [服务器名] 前缀
-SERVER_NAME=
-
-# ----- 监控配置 -----
-# 检查更新间隔(秒)
-# 推荐值: 1800 (30分钟), 3600 (1小时), 21600 (6小时)
+# 检查间隔（秒）
 POLL_INTERVAL=3600
 
-# 是否自动清理旧镜像 (true/false)
+# 自动清理旧镜像
 CLEANUP=true
 
-# 是否启用自动回滚 (更新失败时恢复旧版本)
+# 启用自动回滚
 ENABLE_ROLLBACK=true
-
-# ========================================
 EOF
 
-# 编辑配置文件
+# 编辑配置
 nano .env
 ```
 
-**配置说明：**
-- 必须填写 `BOT_TOKEN` 和 `CHAT_ID`
-- 其他选项可以保持默认值
-- 保存文件: `Ctrl+O` → `Enter` → `Ctrl+X`
+**保存方式**: `Ctrl+O` → `Enter` → `Ctrl+X`
 
-#### 步骤 4: 创建数据目录
+### 步骤 4: 启动服务
 
 ```bash
+# 创建数据目录
 mkdir -p data
-```
 
-#### 步骤 5: 启动服务
-
-```bash
-# 启动服务（后台运行）
+# 启动服务
 docker compose up -d
 
-# 查看启动日志
+# 查看日志
 docker compose logs -f
-
-# 看到启动成功信息后，按 Ctrl+C 退出日志查看
 ```
 
-#### 步骤 6: 验证运行
+### 步骤 5: 验证
+
+启动后 10-30 秒内应该收到 Telegram 启动通知。
 
 ```bash
-# 检查容器状态
+# 检查状态
 docker compose ps
 
-# 应该看到两个容器都在运行:
-# watchtower          running
-# watchtower-notifier running
-
-# 查看通知服务日志
+# 查看日志
 docker compose logs watchtower-notifier | tail -20
 ```
 
-**预期结果：**
-- 启动后 10-30 秒内收到 Telegram 启动成功通知
-- 日志中显示 "服务正常运行中"
+---
+
+## 多服务器部署
+
+多服务器需要共享数据以实现统一管理。支持两种方案：
+
+### 方案一：Tailscale 虚拟局域网（强烈推荐）
+
+**优点：**
+- ✅ 配置简单（5分钟搞定）
+- ✅ 安全加密
+- ✅ 无需配置防火墙
+- ✅ 跨公网内网都可用
+- ✅ 免费（个人使用）
+
+#### 第一步：安装 Tailscale
+
+**在所有服务器上执行（京东云、云服务V2、云服务器V4）：**
+
+```bash
+# 1. 安装 Tailscale
+curl -fsSL https://tailscale.com/install.sh | sh
+
+# 2. 启动并登录（会输出一个链接）
+sudo tailscale up
+
+# 3. 浏览器打开链接，使用 Google/GitHub/Microsoft 账号登录授权
+
+# 4. 查看分配的 IP
+tailscale ip -4
+```
+
+**记录每台服务器的 Tailscale IP：**
+
+```bash
+# 京东云
+tailscale ip -4
+# 输出示例: 100.64.1.10
+
+# 云服务V2
+tailscale ip -4
+# 输出示例: 100.64.1.20
+
+# 云服务器V4
+tailscale ip -4
+# 输出示例: 100.64.1.30
+```
+
+#### 第二步：配置 NFS 服务器
+
+**选择一台服务器作为 NFS 主机（推荐京东云）：**
+
+```bash
+# SSH 登录京东云
+ssh user@京东云IP
+
+# 1. 安装 NFS 服务端
+sudo apt-get update
+sudo apt-get install -y nfs-kernel-server
+
+# 2. 创建共享目录
+sudo mkdir -p /srv/watchtower-shared
+sudo chmod 777 /srv/watchtower-shared
+
+# 3. 配置 NFS 导出
+sudo nano /etc/exports
+```
+
+**在 `/etc/exports` 中添加（使用 Tailscale 内网 IP）：**
+
+```
+/srv/watchtower-shared 100.64.1.20(rw,sync,no_subtree_check,no_root_squash)
+/srv/watchtower-shared 100.64.1.30(rw,sync,no_subtree_check,no_root_squash)
+/srv/watchtower-shared 127.0.0.1(rw,sync,no_subtree_check,no_root_squash)
+```
+
+或者允许所有 Tailscale 网段（更方便）：
+
+```
+/srv/watchtower-shared 100.64.0.0/10(rw,sync,no_subtree_check,no_root_squash)
+```
+
+```bash
+# 4. 应用配置
+sudo exportfs -ra
+sudo systemctl restart nfs-kernel-server
+
+# 5. 验证 NFS
+sudo systemctl status nfs-kernel-server
+showmount -e localhost
+```
+
+#### 第三步：安装 NFS 客户端
+
+**在所有服务器上（包括 NFS 主机）：**
+
+```bash
+sudo apt-get install -y nfs-common
+```
+
+#### 第四步：测试 NFS 连接
+
+**在其他服务器（云服务V2、云服务器V4）上测试：**
+
+```bash
+# 测试能否看到共享
+showmount -e 100.64.1.10  # 京东云的 Tailscale IP
+
+# 应该显示：
+# Export list for 100.64.1.10:
+# /srv/watchtower-shared ...
+
+# 测试挂载
+sudo mkdir -p /mnt/test
+sudo mount -t nfs 100.64.1.10:/srv/watchtower-shared /mnt/test
+ls -la /mnt/test
+sudo touch /mnt/test/test.txt
+ls /mnt/test
+sudo umount /mnt/test
+```
+
+#### 第五步：配置 Docker Compose
+
+**京东云（NFS 主机）的 `docker-compose.yml`：**
+
+```yaml
+services:
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - WATCHTOWER_NO_STARTUP_MESSAGE=true
+      - TZ=Asia/Shanghai
+      - WATCHTOWER_CLEANUP=${CLEANUP:-true}
+      - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-3600}
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+
+  watchtower-notifier:
+    image: w254992/watchtower-telegram-monitor:latest
+    container_name: watchtower-notifier
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - nfs-data:/data
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+
+volumes:
+  nfs-data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=127.0.0.1,rw,nfsvers=4
+      device: ":/srv/watchtower-shared"
+```
+
+**云服务V2 和 云服务器V4 的 `docker-compose.yml`：**
+
+```yaml
+services:
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - WATCHTOWER_NO_STARTUP_MESSAGE=true
+      - TZ=Asia/Shanghai
+      - WATCHTOWER_CLEANUP=${CLEANUP:-true}
+      - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-3600}
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+
+  watchtower-notifier:
+    image: w254992/watchtower-telegram-monitor:latest
+    container_name: watchtower-notifier
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - nfs-data:/data
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+
+volumes:
+  nfs-data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=100.64.1.10,rw,nfsvers=4  # 京东云的 Tailscale IP
+      device: ":/srv/watchtower-shared"
+```
+
+#### 第六步：配置环境变量
+
+**每台服务器的 `.env` 文件（唯一区别是 SERVER_NAME）：**
+
+京东云：
+```bash
+BOT_TOKEN=相同的_bot_token
+CHAT_ID=相同的_chat_id
+SERVER_NAME=京东云
+POLL_INTERVAL=3600
+```
+
+云服务V2：
+```bash
+BOT_TOKEN=相同的_bot_token
+CHAT_ID=相同的_chat_id
+SERVER_NAME=云服务V2
+POLL_INTERVAL=3600
+```
+
+云服务器V4：
+```bash
+BOT_TOKEN=相同的_bot_token
+CHAT_ID=相同的_chat_id
+SERVER_NAME=云服务器V4
+POLL_INTERVAL=3600
+```
+
+#### 第七步：启动服务
+
+```bash
+# 1. 在京东云启动
+cd ~/watchtower
+docker compose up -d
+docker compose logs -f watchtower-notifier
+
+# 2. 在云服务V2启动
+cd ~/watchtower
+docker compose up -d
+docker compose logs -f watchtower-notifier
+
+# 3. 在云服务器V4启动
+cd ~/watchtower
+docker compose up -d
+docker compose logs -f watchtower-notifier
+```
+
+#### 第八步：验证多服务器
+
+在 Telegram 中发送：
+
+```
+/servers
+```
+
+应该看到：
+
+```
+🌐 在线服务器 (3)
+
+🖥️ 京东云 (8个容器)
+   最后心跳: 刚刚
+
+🖥️ 云服务V2 (5个容器)
+   最后心跳: 30秒前
+
+🖥️ 云服务器V4 (3个容器)
+   最后心跳: 1分钟前
+```
 
 ---
 
-### 方式 2: Docker Run
+### 方案二：公网 NFS
 
-如果不想使用 Docker Compose，可以用传统的 `docker run` 命令。
+**适用场景：** 主服务器有公网 IP，其他服务器可直接访问
 
-#### 步骤 1: 创建数据目录
+**风险提示：** 需要正确配置安全组/防火墙，否则存在安全风险
+
+#### 第一步：配置 NFS 服务器
 
 ```bash
-mkdir -p ~/watchtower/data
+# 在京东云（公网 IP: 117.72.165.47）
+
+# 1. 安装 NFS
+sudo apt-get install -y nfs-kernel-server
+
+# 2. 创建共享目录
+sudo mkdir -p /srv/watchtower-shared
+sudo chmod 777 /srv/watchtower-shared
+
+# 3. 配置导出（使用公网 IP）
+sudo nano /etc/exports
 ```
 
-#### 步骤 2: 启动 Watchtower
+**指定服务器 IP（推荐）：**
 
-```bash
-docker run -d \
-  --name watchtower \
-  --restart unless-stopped \
-  --network host \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /etc/localtime:/etc/localtime:ro \
-  -e WATCHTOWER_CLEANUP=true \
-  -e WATCHTOWER_POLL_INTERVAL=3600 \
-  -e WATCHTOWER_NO_STARTUP_MESSAGE=true \
-  -e TZ=Asia/Shanghai \
-  --label com.centurylinklabs.watchtower.enable=false \
-  containrrr/watchtower:latest
+```
+/srv/watchtower-shared 云服务V2的公网IP(rw,sync,no_subtree_check,no_root_squash,insecure)
+/srv/watchtower-shared 云服务器V4的公网IP(rw,sync,no_subtree_check,no_root_squash,insecure)
+/srv/watchtower-shared 127.0.0.1(rw,sync,no_subtree_check,no_root_squash,insecure)
 ```
 
-#### 步骤 3: 启动通知服务
+**或允许所有 IP（测试用）：**
 
-```bash
-docker run -d \
-  --name watchtower-notifier \
-  --restart unless-stopped \
-  --network host \
-  -v /var/run/docker.sock:/var/run/docker.sock:ro \
-  -v ~/watchtower/data:/data \
-  -e BOT_TOKEN="你的_bot_token" \
-  -e CHAT_ID="你的_chat_id" \
-  -e SERVER_NAME="我的服务器" \
-  -e POLL_INTERVAL=3600 \
-  -e CLEANUP=true \
-  -e ENABLE_ROLLBACK=true \
-  -e TZ=Asia/Shanghai \
-  --label com.centurylinklabs.watchtower.enable=false \
-  w254992/watchtower-telegram-monitor:latest
+```
+/srv/watchtower-shared *(rw,sync,no_subtree_check,no_root_squash,insecure)
 ```
 
-**注意:** 记得替换 `BOT_TOKEN` 和 `CHAT_ID`
+```bash
+# 4. 应用配置
+sudo exportfs -ra
+sudo systemctl restart nfs-kernel-server
+```
 
-#### 验证运行
+#### 第二步：配置防火墙和安全组
+
+**1. 服务器防火墙（ufw）：**
 
 ```bash
-# 查看容器状态
-docker ps | grep watchtower
+# 允许指定 IP 访问
+sudo ufw allow from 云服务V2的IP to any port 2049
+sudo ufw allow from 云服务V2的IP to any port 111
+sudo ufw allow from 云服务器V4的IP to any port 2049
+sudo ufw allow from 云服务器V4的IP to any port 111
 
-# 查看日志
-docker logs watchtower-notifier
+# 或允许所有（不推荐）
+sudo ufw allow 2049
+sudo ufw allow 111
+```
+
+**2. 京东云安全组（重要！）：**
+
+登录京东云控制台，添加入站规则：
+
+| 协议 | 端口 | 源地址 | 说明 |
+|------|------|--------|------|
+| TCP | 2049 | 云服务V2的IP/32 | NFS 主端口 |
+| TCP | 111 | 云服务V2的IP/32 | RPC 端口 |
+| TCP | 2049 | 云服务器V4的IP/32 | NFS 主端口 |
+| TCP | 111 | 云服务器V4的IP/32 | RPC 端口 |
+
+#### 第三步：其他服务器安装客户端
+
+```bash
+# 在云服务V2 和 云服务器V4
+sudo apt-get install -y nfs-common
+```
+
+#### 第四步：测试连接
+
+```bash
+# 在云服务V2 测试
+showmount -e 117.72.165.47
+
+# 测试挂载
+sudo mkdir -p /mnt/test
+sudo mount -t nfs 117.72.165.47:/srv/watchtower-shared /mnt/test
+ls /mnt/test
+sudo touch /mnt/test/test.txt
+sudo umount /mnt/test
+```
+
+#### 第五步：配置 Docker Compose
+
+**京东云：**
+
+```yaml
+volumes:
+  nfs-data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=127.0.0.1,rw,nfsvers=4
+      device: ":/srv/watchtower-shared"
+```
+
+**其他服务器：**
+
+```yaml
+volumes:
+  nfs-data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=117.72.165.47,rw,nfsvers=4,insecure
+      device: ":/srv/watchtower-shared"
 ```
 
 ---
 
-### 方式 3: 从源码构建
-
-适合需要自定义修改的用户。
-
-#### 步骤 1: 克隆仓库
-
-```bash
-git clone https://github.com/Celestials316/watchtower-telegram-monitor.git
-cd watchtower-telegram-monitor
-```
-
-#### 步骤 2: 构建镜像
-
-```bash
-# 构建镜像
-docker build -f docker/Dockerfile -t watchtower-monitor:local .
-
-# 查看构建结果
-docker images | grep watchtower-monitor
-```
-
-#### 步骤 3: 修改配置
-
-```bash
-# 复制配置模板
-cp config/.env.example .env
-nano .env
-
-# 修改 docker-compose.yml 中的镜像名
-sed -i 's|w254992/watchtower-telegram-monitor:latest|watchtower-monitor:local|g' docker/docker-compose.yml
-```
-
-#### 步骤 4: 启动服务
-
-```bash
-docker compose -f docker/docker-compose.yml up -d
-```
-
----
-
-## 🎫 获取 Telegram 凭证
+## 获取 Telegram 凭证
 
 ### 获取 Bot Token
 
-1. **打开 Telegram**，搜索 `@BotFather`
+1. 在 Telegram 搜索 `@BotFather`
+2. 发送 `/newbot`
+3. 设置机器人名称和用户名（必须以 `bot` 结尾）
+4. 获取 Token（格式：`123456789:ABCdefGHI...`）
 
-2. **创建新机器人**
-   ```
-   /newbot
-   ```
+**测试 Token：**
 
-3. **设置机器人名称**
-   ```
-   Bot 显示名称: 容器监控助手
-   Bot 用户名: my_docker_monitor_bot
-   ```
-   用户名必须以 `bot` 结尾
-
-4. **获取 Token**
-   
-   BotFather 会返回类似这样的消息：
-   ```
-   Done! Congratulations on your new bot.
-   ...
-   Use this token to access the HTTP API:
-   1234567890:ABCdefGHIjklMNOpqrsTUVwxyz1234567
-   ```
-   
-   复制这个 Token
-
-5. **测试 Token**
-   ```bash
-   curl "https://api.telegram.org/bot你的TOKEN/getMe"
-   ```
-   
-   应该返回机器人信息
+```bash
+curl "https://api.telegram.org/bot你的TOKEN/getMe"
+```
 
 ### 获取 Chat ID
 
-有三种方法获取你的 Chat ID：
+**方法 1：使用 @userinfobot（最简单）**
 
-#### 方法 1: 使用 @userinfobot (最简单)
-
-1. 在 Telegram 搜索 `@userinfobot`
+1. 搜索 `@userinfobot`
 2. 点击 Start
-3. 机器人会显示你的 ID
-   ```
-   Your ID: 123456789
-   ```
+3. 获取你的 ID
 
-#### 方法 2: 发消息获取
+**方法 2：发消息获取**
 
-1. 给你的 Bot 发送任意消息（必须先做这一步）
-2. 访问以下网址（替换 TOKEN）:
-   ```
-   https://api.telegram.org/bot你的TOKEN/getUpdates
-   ```
+1. 先给你的 Bot 发送任意消息
+2. 访问：`https://api.telegram.org/bot你的TOKEN/getUpdates`
+3. 在 JSON 中找到 `chat.id`
 
-3. 在返回的 JSON 中找到 `chat.id`:
-   ```json
-   {
-     "result": [
-       {
-         "update_id": 123456789,
-         "message": {
-           "chat": {
-             "id": 987654321,  // ← 这是你的 Chat ID
-             "type": "private"
-           }
-         }
-       }
-     ]
-   }
-   ```
-
-#### 方法 3: 使用命令行工具
+**方法 3：命令行**
 
 ```bash
-# 替换 YOUR_TOKEN
 TOKEN="你的_bot_token"
 
-# 先给 Bot 发送一条消息，然后运行:
+# 先给 Bot 发消息，然后运行：
 curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" | \
   grep -o '"chat":{"id":[0-9]*' | \
   grep -o '[0-9]*$'
@@ -426,76 +595,15 @@ curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" | \
 ### 测试凭证
 
 ```bash
-# 测试发送消息
 BOT_TOKEN="你的_token"
 CHAT_ID="你的_chat_id"
 
 curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
   -d "chat_id=${CHAT_ID}" \
-  -d "text=测试消息 - 如果收到这条消息说明配置正确"
+  -d "text=测试消息"
 ```
 
-如果收到消息，说明配置正确！
-
----
-
-## 配置说明
-
-### 环境变量详解
-
-| 变量名 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `BOT_TOKEN` | String | - | Telegram Bot Token，**必填** |
-| `CHAT_ID` | String/Number | - | Telegram Chat ID，**必填** |
-| `SERVER_NAME` | String | 空 | 服务器标识，显示在通知前缀 |
-| `POLL_INTERVAL` | Number | 3600 | 检查间隔(秒) |
-| `CLEANUP` | Boolean | true | 是否自动清理旧镜像 |
-| `ENABLE_ROLLBACK` | Boolean | true | 是否启用自动回滚 |
-
-### 检查间隔建议
-
-| 间隔 | 秒数 | 适用场景 |
-|------|------|----------|
-| 30 分钟 | 1800 | 开发环境，频繁更新 |
-| 1 小时 | 3600 | **推荐**，生产环境 |
-| 6 小时 | 21600 | 稳定环境 |
-| 12 小时 | 43200 | 低频更新 |
-| 24 小时 | 86400 | 极低频更新 |
-
-### 监控特定容器
-
-默认监控所有容器。如需监控特定容器：
-
-1. 编辑 `docker-compose.yml`
-2. 在 `watchtower` 服务下添加 `command` 部分：
-
-```yaml
-services:
-  watchtower:
-    # ... 其他配置 ...
-    command:
-      - nginx      # 只监控这些容器
-      - mysql
-      - redis
-      - app
-```
-
-3. 重启服务：
-```bash
-docker compose restart
-```
-
-### 排除容器监控
-
-给不想监控的容器添加标签：
-
-```yaml
-services:
-  my-container:
-    image: xxx
-    labels:
-      - "com.centurylinklabs.watchtower.enable=false"
-```
+收到消息说明配置正确！
 
 ---
 
@@ -504,454 +612,253 @@ services:
 ### 1. 检查容器状态
 
 ```bash
-# 查看容器运行状态
 docker compose ps
 
-# 预期输出:
-# NAME                  IMAGE                                      STATUS
-# watchtower            containrrr/watchtower:latest              Up 2 minutes (healthy)
-# watchtower-notifier   w254992/watchtower-telegram-monitor:...   Up 2 minutes (healthy)
+# 应该看到：
+# watchtower            Up
+# watchtower-notifier   Up
 ```
 
-### 2. 检查健康状态
-
-```bash
-# 查看健康检查结果
-docker inspect watchtower | grep -A 5 "Health"
-docker inspect watchtower-notifier | grep -A 5 "Health"
-
-# 状态应该是 "healthy"
-```
-
-### 3. 查看日志
+### 2. 检查日志
 
 ```bash
 # 查看启动日志
-docker compose logs watchtower-notifier | head -30
+docker compose logs watchtower-notifier | tail -30
 
-# 应该看到类似输出:
-# ==========================================
-# Docker 容器监控通知服务 v3.3.0
-# 服务器: 我的服务器
-# 启动时间: 2024-11-04 10:30:00
-# 回滚功能: true
-# ==========================================
+# 应该看到 "服务正常运行中"
 ```
 
-### 4. 检查 Telegram 通知
+### 3. 检查 Telegram 通知
 
 启动后 10-30 秒内应该收到启动成功通知。
 
-如果没收到，检查日志中是否有错误：
+### 4. 测试命令
 
-```bash
-docker compose logs watchtower-notifier | grep -i "error\|fail\|✗"
+在 Telegram 发送：
+
+```
+/help
 ```
 
-### 5. 手动测试通知
+应该收到命令列表。
 
-重启通知服务会触发启动通知：
-
-```bash
-docker compose restart watchtower-notifier
-
-# 等待 10 秒
-sleep 10
-
-# 查看日志确认
-docker compose logs watchtower-notifier | tail -20
-```
-
-### 6. 测试容器更新检测
-
-强制触发一次检查：
+### 5. 多服务器验证
 
 ```bash
-# 手动执行一次 Watchtower 检查
-docker run --rm \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  containrrr/watchtower:latest \
-  --run-once \
-  --debug
+# 查看共享数据
+docker exec watchtower-notifier ls -la /data
 
-# 查看是否有更新通知
+# 应该看到：
+# server_registry.json
+# monitor_config.json
+
+# 查看服务器注册表
+docker exec watchtower-notifier cat /data/server_registry.json
+
+# 应该看到所有服务器的心跳信息
 ```
 
 ---
 
-## 🔧 故障排查
+## 故障排查
 
-### 问题 1: 收不到 Telegram 通知
+### 问题 1：收不到 Telegram 通知
 
-#### 症状
-- 容器正常运行
-- 日志中没有错误
-- 但不收到 Telegram 消息
-
-#### 解决方法
-
-**1. 验证 Bot Token 和 Chat ID**
+**检查配置：**
 
 ```bash
-# 检查配置
-cd ~/watchtower
-cat .env | grep -E "BOT_TOKEN|CHAT_ID"
-
-# 手动测试 API
-BOT_TOKEN="你的token"
-CHAT_ID="你的chatid"
-
-curl -s "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-  -d "chat_id=${CHAT_ID}" \
-  -d "text=手动测试消息"
+cat .env
+docker exec watchtower-notifier sh -c 'echo $BOT_TOKEN $CHAT_ID'
 ```
 
-**2. 确保给 Bot 发送过消息**
-
-必须先在 Telegram 中给 Bot 发送至少一条消息（任意内容），Bot 才能主动发消息给你。
-
-**3. 检查 Bot 是否被阻止**
+**测试 API：**
 
 ```bash
-# 获取 Bot 信息
 curl "https://api.telegram.org/bot你的TOKEN/getMe"
-
-# 检查 Chat 信息
-curl "https://api.telegram.org/bot你的TOKEN/getChat?chat_id=你的CHATID"
 ```
 
-**4. 查看详细日志**
+**必须先给 Bot 发送过消息！**
+
+**查看日志：**
 
 ```bash
-# 查看发送失败的详细原因
-docker logs watchtower-notifier 2>&1 | grep -A 5 "Telegram"
+docker logs watchtower-notifier | grep -i error
 ```
 
-**5. 进入容器手动测试**
+### 问题 2：NFS 连接失败（多服务器）
+
+**Tailscale 方案：**
 
 ```bash
-docker exec -it watchtower-notifier sh
+# 检查 Tailscale 状态
+sudo tailscale status
 
-# 在容器内测试
-apk add curl
-curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-  --data-urlencode "chat_id=${CHAT_ID}" \
-  --data-urlencode "text=容器内测试"
+# 测试连通性
+ping 100.64.1.10
 
-exit
+# 检查 NFS
+showmount -e 100.64.1.10
 ```
 
-### 问题 2: 容器无法启动
+**公网 NFS 方案：**
 
-#### 症状
 ```bash
-docker compose ps
-# 显示容器状态为 Exited 或 Restarting
+# 测试端口
+telnet 117.72.165.47 2049
+
+# 检查防火墙
+sudo ufw status
+
+# 检查 NFS 导出
+sudo exportfs -v
+
+# 确保有 insecure 选项
 ```
 
-#### 解决方法
-
-**1. 查看详细错误**
+### 问题 3：容器无法启动
 
 ```bash
-# 查看完整日志
-docker compose logs watchtower-notifier
-
-# 查看最近 50 行
+# 查看详细错误
 docker logs watchtower-notifier --tail 50
-```
 
-**2. 检查 Docker socket 权限**
-
-```bash
-# 检查权限
+# 检查 Docker socket 权限
 ls -la /var/run/docker.sock
 
-# 输出应该类似:
-# srw-rw---- 1 root docker 0 Nov 4 10:00 /var/run/docker.sock
-
-# 如果没有权限，临时修复:
-sudo chmod 666 /var/run/docker.sock
-
-# 永久解决（将当前用户加入 docker 组）:
-sudo usermod -aG docker $USER
-newgrp docker
-```
-
-**3. 检查环境变量**
-
-```bash
-# 验证 .env 文件格式
-cat .env
-
-# 确保:
-# - 没有多余的空格
-# - 没有引号包裹值（除非必要）
-# - 每行一个变量
-```
-
-**4. 检查磁盘空间**
-
-```bash
-# 检查可用空间
+# 检查磁盘空间
 df -h
 
-# 清理 Docker 空间
-docker system prune -a --volumes
-```
-
-**5. 重新创建容器**
-
-```bash
-cd ~/watchtower
+# 重建容器
 docker compose down -v
 docker compose up -d
 ```
 
-### 问题 3: 网络连接问题
-
-#### 症状
-日志中出现：
-```
-TLS handshake timeout
-Get "https://registry-1.docker.io/v2/": EOF
-net/http: TLS handshake timeout
-```
-
-#### 解决方法
-
-**1. 配置 Docker 镜像加速器（中国大陆必须）**
+### 问题 4：多服务器数据不同步
 
 ```bash
-# 创建或编辑 Docker 配置
-sudo mkdir -p /etc/docker
+# 检查 NFS 挂载
+docker exec watchtower-notifier df -h | grep data
+
+# 查看共享文件
+docker exec watchtower-notifier ls -la /data
+
+# 测试写入
+docker exec watchtower-notifier sh -c 'echo test > /data/test.txt'
+
+# 在另一台服务器查看
+docker exec watchtower-notifier cat /data/test.txt
+```
+
+### 问题 5：网络问题（中国大陆）
+
+**配置 Docker 镜像加速：**
+
+```bash
 sudo tee /etc/docker/daemon.json <<-'EOF'
 {
   "registry-mirrors": [
     "https://docker.m.daocloud.io",
-    "https://docker.mirrors.sjtug.sjtu.edu.cn",
-    "https://registry.docker-cn.com",
-    "https://hub-mirror.c.163.com"
-  ],
-  "dns": ["8.8.8.8", "8.8.4.4"],
-  "max-concurrent-downloads": 10
+    "https://docker.mirrors.sjtug.sjtu.edu.cn"
+  ]
 }
 EOF
 
-# 重启 Docker
-sudo systemctl daemon-reload
 sudo systemctl restart docker
-
-# 验证配置
-docker info | grep -A 5 "Registry Mirrors"
-
-# 重启监控服务
-cd ~/watchtower
-docker compose restart
+cd ~/watchtower && docker compose restart
 ```
 
-**2. 增加超时时间**
-
-编辑 `docker-compose.yml`，在 `watchtower` 服务的 `environment` 中添加：
+**配置代理：**
 
 ```yaml
-- WATCHTOWER_TIMEOUT=60s
-- WATCHTOWER_HTTP_API_TIMEOUT=300
+environment:
+  - HTTP_PROXY=http://127.0.0.1:7890
+  - HTTPS_PROXY=http://127.0.0.1:7890
 ```
 
-重启：
-```bash
-docker compose restart watchtower
-```
-
-**3. 配置代理（如果有）**
+### 问题 6：showmount 超时
 
 ```bash
-sudo mkdir -p /etc/systemd/system/docker.service.d
-sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf <<-EOF
-[Service]
-Environment="HTTP_PROXY=http://proxy.example.com:8080"
-Environment="HTTPS_PROXY=http://proxy.example.com:8080"
-Environment="NO_PROXY=localhost,127.0.0.1"
-EOF
+# 检查 NFS 服务
+sudo systemctl status nfs-kernel-server
 
-sudo systemctl daemon-reload
-sudo systemctl restart docker
-```
+# 检查端口监听
+sudo netstat -tulpn | grep -E '2049|111'
 
-**4. 测试网络连通性**
-
-```bash
-# 测试能否访问 Docker Hub
-curl -I https://registry-1.docker.io/v2/
-
-# 测试 DNS 解析
-docker run --rm alpine nslookup registry-1.docker.io
-
-# 测试拉取镜像
-docker pull hello-world
-```
-
-### 问题 4: 数据库权限问题
-
-#### 症状
-```
-✗ 无法创建状态文件
-✗ 无法更新状态文件
-```
-
-#### 解决方法
-
-```bash
-# 检查数据目录权限
-ls -la ~/watchtower/data/
-
-# 修复权限
-sudo chown -R $(id -u):$(id -g) ~/watchtower/data/
-chmod 755 ~/watchtower/data/
-
-# 重启服务
-cd ~/watchtower
-docker compose restart watchtower-notifier
-```
-
-### 问题 5: 端口冲突（使用 host 网络）
-
-#### 症状
-```
-Error starting userland proxy: listen tcp 0.0.0.0:7768: bind: address already in use
-```
-
-#### 解决方法
-
-```bash
-# 查看端口占用
-sudo netstat -tulpn | grep :7768
-# 或
-sudo lsof -i :7768
-
-# 停止占用端口的服务
-sudo systemctl stop 服务名
-
-# 或杀死进程
-sudo kill -9 进程PID
-```
-
-### 问题 6: 更新检测不工作
-
-#### 症状
-- 容器有更新但没有检测到
-- 日志显示 `Updated=0`
-
-#### 解决方法
-
-**1. 手动触发检查**
-
-```bash
-# 强制检查一次
-docker run --rm \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  containrrr/watchtower:latest \
-  --run-once \
-  --debug
-
-# 查看输出，确认能否检测到更新
-```
-
-**2. 检查容器标签**
-
-确保要监控的容器没有被排除：
-
-```bash
-# 查看容器标签
-docker inspect 容器名 | grep -i watchtower
-
-# 如果看到 "watchtower.enable=false"，需要移除该标签
-```
-
-**3. 验证镜像更新**
-
-```bash
-# 手动拉取最新镜像
-docker pull 镜像名:标签
-
-# 查看是否有新版本
-docker images | grep 镜像名
-```
-
-**4. 检查 Watchtower 配置**
-
-```bash
-# 查看 Watchtower 环境变量
-docker inspect watchtower | grep -A 20 "Env"
-
-# 确认监控范围
-docker exec watchtower ps aux | grep watchtower
+# 重启 NFS
+sudo systemctl restart nfs-kernel-server
+sudo exportfs -ra
 ```
 
 ---
 
-## 高级配置
+## 常用命令
 
-### 多服务器部署
-
-为每台服务器创建不同的配置：
+### Docker Compose
 
 ```bash
-# 服务器 1 (生产环境)
-SERVER_NAME=生产服务器
-POLL_INTERVAL=3600
-ENABLE_ROLLBACK=true
+# 启动
+docker compose up -d
 
-# 服务器 2 (测试环境)
-SERVER_NAME=测试服务器
-POLL_INTERVAL=1800
-ENABLE_ROLLBACK=false
+# 停止
+docker compose down
 
-# 服务器 3 (开发环境)
-SERVER_NAME=开发环境
-POLL_INTERVAL=900
-ENABLE_ROLLBACK=false
+# 重启
+docker compose restart
+
+# 查看日志
+docker compose logs -f
+
+# 更新
+docker compose pull
+docker compose up -d
 ```
 
-### 自定义通知格式
+### 查看状态
 
-如果需要修改通知样式，可以挂载自定义 `monitor.sh`：
+```bash
+# 容器状态
+docker compose ps
 
-```yaml
-services:
-  watchtower-notifier:
-    volumes:
-      - ./custom-monitor.sh:/app/monitor.sh:ro
-      # ... 其他配置
+# 资源使用
+docker stats watchtower watchtower-notifier
+
+# 详细信息
+docker inspect watchtower-notifier
 ```
 
-### 配置日志轮转
+### NFS 管理
 
-```yaml
-services:
-  watchtower:
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"    # 单个日志文件最大 10MB
-        max-file: "3"      # 保留最近 3 个文件
+```bash
+# 查看 NFS 导出
+sudo exportfs -v
+
+# 查看挂载点
+showmount -e localhost
+
+# 重新加载配置
+sudo exportfs -ra
+
+# 重启 NFS
+sudo systemctl restart nfs-kernel-server
 ```
 
-### 使用外部数据库
+### Tailscale 管理
 
-如果需要将状态存储到外部数据库（如 MySQL/PostgreSQL），需要修改 `monitor.sh`。
+```bash
+# 查看状态
+sudo tailscale status
 
-### 集成告警系统
+# 查看 IP
+tailscale ip -4
 
-除了 Telegram，还可以集成其他告警方式：
+# 重启
+sudo systemctl restart tailscaled
 
-- Email
-- Slack
-- 企业微信
-- 钉钉
+# 退出网络
+sudo tailscale down
 
-需要修改 `send_telegram()` 函数添加额外的通知渠道。
+# 重新加入
+sudo tailscale up
+```
 
 ---
 
@@ -960,11 +867,10 @@ services:
 - 📖 查看 [README.md](../README.md) 了解功能特性
 - ⚙️ 查看 [CONFIGURATION.md](CONFIGURATION.md) 了解高级配置
 - 🐛 遇到问题？查看 [FAQ.md](FAQ.md)
-- 💬 加入 [讨论区](https://github.com/Celestials316/watchtower-telegram-monitor/discussions)
 
 ---
 
-**安装过程中遇到问题？**
+**需要帮助？**
 
-- 🐛 [提交 Issue](https://github.com/Celestials316/watchtower-telegram-monitor/issues/new)
-- 💬 [讨论区求助](https://github.com/Celestials316/watchtower-telegram-monitor/discussions)
+- 🐛 [提交 Issue](https://github.com/Celestials316/watchtower-telegram-monitor/issues)
+- 💬 [讨论区](https://github.com/Celestials316/watchtower-telegram-monitor/discussions)
