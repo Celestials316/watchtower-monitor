@@ -35,7 +35,7 @@ services:
       - "com.centurylinklabs.watchtower.enable=false"
 
   watchtower-notifier:
-    image: w254992/watchtower-telegram-monitor:latest 
+    image: w254992/watchtower-telegram-monitor:latest
     container_name: watchtower-notifier
     restart: unless-stopped
     network_mode: host
@@ -49,34 +49,6 @@ services:
       - .env
     environment:
       - TZ=Asia/Shanghai
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    labels:
-      - "com.centurylinklabs.watchtower.enable=false"
-
-  watchtower-notifier:
-    image: w254992/watchtower-telegram-monitor:latest
-    container_name: watchtower-notifier
-    restart: unless-stopped
-    network_mode: host
-    depends_on:
-      watchtower:
-        condition: service_started
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - monitor-data:/data
-    environment:
-      - TZ=Asia/Shanghai
-      - BOT_TOKEN=your_bot_token_here  # 必填：Telegram bot token
-      - CHAT_ID=your_chat_id_here  # 必填：Telegram chat ID
-      - SERVER_NAME=  # 可选：服务器名称（用于多服务器区分）
-      - POLL_INTERVAL=3600  # 可选：检查间隔（秒）
-      - CLEANUP=true  # 可选：是否自动清理旧镜像
-      - ENABLE_ROLLBACK=true  # 可选：是否启用自动回滚
-      - MONITORED_CONTAINERS=  # 可选：监控的容器列表（留空表示监控所有）
       # 代理配置（可选，适用于中国大陆用户）
       # - HTTP_PROXY=http://127.0.0.1:7890
       # - HTTPS_PROXY=http://127.0.0.1:7890
@@ -87,13 +59,10 @@ services:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      test: ["CMD", "sh", "-c", "ps aux | grep -v grep | grep -q 'command_listener'"]
+      test: ["CMD", "sh", "-c", "ps aux | grep -v grep | grep -q 'bot_handler'"]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 15s
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
-
-volumes:
-  monitor-data:
