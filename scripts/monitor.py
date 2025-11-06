@@ -1478,32 +1478,32 @@ class WatchtowerMonitor:
 ━━━━━━━━━━━━━━━━━━━━""")
 
 def main():
-   if not SERVER_NAME:
-       logger.error("错误: 必须设置 SERVER_NAME 环境变量")
-       sys.exit(1)
+    if not SERVER_NAME:
+        logger.error("错误: 必须设置 SERVER_NAME 环境变量")
+        sys.exit(1)
 
-   if not CHAT_ID or not os.getenv('BOT_TOKEN'):
-       logger.error("错误: 必须设置 BOT_TOKEN 和 CHAT_ID 环境变量")
-       sys.exit(1)
+    if not CHAT_ID or not os.getenv('BOT_TOKEN'):
+        logger.error("错误: 必须设置 BOT_TOKEN 和 CHAT_ID 环境变量")
+        sys.exit(1)
 
-   print("=" * 50)
-   print(f"Docker 容器监控通知服务 v{VERSION}")
-   print(f"服务器: {SERVER_NAME}")
-   print(f"主服务器: {PRIMARY_SERVER}")
-   print(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-   print(f"Python 版本: {sys.version.split()[0]}")
-   print("=" * 50)
-   print()
+    print("=" * 50)
+    print(f"Docker 容器监控通知服务 v{VERSION}")
+    print(f"服务器: {SERVER_NAME}")
+    print(f"主服务器: {PRIMARY_SERVER}")
+    print(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Python 版本: {sys.version.split()[0]}")
+    print("=" * 50)
+    print()
 
-   bot = TelegramBot(os.getenv('BOT_TOKEN'), CHAT_ID, SERVER_NAME)
-   docker = DockerManager()
-   config = ConfigManager(MONITOR_CONFIG, SERVER_NAME)
-   registry = ServerRegistry(SERVER_REGISTRY, SERVER_NAME, PRIMARY_SERVER)
-   coordinator = CommandCoordinator(SERVER_NAME, PRIMARY_SERVER, SERVER_REGISTRY)
+    bot = TelegramBot(os.getenv('BOT_TOKEN'), CHAT_ID, SERVER_NAME)
+    docker = DockerManager()
+    config = ConfigManager(MONITOR_CONFIG, SERVER_NAME)
+    registry = ServerRegistry(SERVER_REGISTRY, SERVER_NAME, PRIMARY_SERVER)
+    coordinator = CommandCoordinator(SERVER_NAME, PRIMARY_SERVER, SERVER_REGISTRY)
 
-   registry.register()
+    registry.register()
 
-   if not PRIMARY_SERVER:
+    if not PRIMARY_SERVER:
         logger.info("从服务器等待 0.5 秒...")
         time.sleep(0.5)
 
