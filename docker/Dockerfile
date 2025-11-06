@@ -1,41 +1,39 @@
-FROM alpine:3.19
+
+# 文件名: Dockerfile
+
+FROM python:3.11-alpine
 
 LABEL maintainer="Celestials316" \
-      description="Docker container monitoring with Telegram notifications and command interaction" \
-      version="3.4.0"
+      description="Docker container monitoring with Telegram notifications (Python version)" \
+      version="5.0.0"
 
 # 安装依赖
 RUN apk add --no-cache \
-    bash \
-    curl \
     docker-cli \
-    coreutils \
-    grep \
-    sed \
+    curl \
     tzdata \
-    jq \
     && rm -rf /var/cache/apk/*
 
 # 设置时区
 ENV TZ=Asia/Shanghai
+ENV PYTHONUNBUFFERED=1
 
 # 创建工作目录
 WORKDIR /app
 
-# 复制脚本文件
-COPY scripts/monitor.sh /app/monitor.sh
-COPY scripts/manage.sh /app/manage.sh
+# 复制 Python 脚本
+COPY scripts/monitor.py /app/monitor.py
 
-# 设置执行权限
-RUN chmod +x /app/*.sh
+# 安装 Python 依赖
+RUN pip install --no-cache-dir requests
 
 # 创建数据目录
 RUN mkdir -p /data
 
-# 健康检查 - 检查命令监听器是否运行
+# 健康检查 - 检查 Python 进程是否运行
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=15s \
-    CMD ps aux | grep -v grep | grep -q 'command_listener' || exit 1
+    CMD ps aux | grep -v grep | grep -q 'python.*monitor.py' || exit 1
 
 # 设置入口点
-ENTRYPOINT ["/bin/bash"]
-CMD ["/app/monitor.sh"]
+ENTRYPOINT ["python3"]
+CMD ["/app/monitor.py"]
