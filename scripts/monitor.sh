@@ -554,9 +554,9 @@ handle_callback() {
 ━━━━━━━━━━━━━━━━━━━━"
             
             buttons='{"inline_keyboard":['
-            buttons="$buttons"'[{"text":"✅ 确认更新","callback_data":"confirm_update:'"$param"'"}],'
-            buttons="$buttons"'[{"text":"❌ 取消","callback_data":"cancel"}]'
-            buttons="$buttons"']}'
+            buttons="${buttons}[{\"text\":\"✅ 确认更新\",\"callback_data\":\"confirm_update:${param}\"}],"
+            buttons="${buttons}[{\"text\":\"❌ 取消\",\"callback_data\":\"cancel\"}]"
+            buttons="${buttons}]}"
             
             edit_message "$chat_id" "$message_id" "$confirm_msg" "$buttons"
             ;;
@@ -601,9 +601,9 @@ handle_callback() {
 ━━━━━━━━━━━━━━━━━━━━"
             
             buttons='{"inline_keyboard":['
-            buttons="$buttons"'[{"text":"✅ 确认重启","callback_data":"confirm_restart:'"$param"'"}],'
-            buttons="$buttons"'[{"text":"❌ 取消","callback_data":"cancel"}]'
-            buttons="$buttons"']}'
+            buttons="${buttons}[{\"text\":\"✅ 确认重启\",\"callback_data\":\"confirm_restart:${param}\"}],"
+            buttons="${buttons}[{\"text\":\"❌ 取消\",\"callback_data\":\"cancel\"}]"
+            buttons="${buttons}]}"
             
             edit_message "$chat_id" "$message_id" "$confirm_msg" "$buttons"
             ;;
@@ -743,17 +743,21 @@ bot_handler() {
             if [ -n "$message" ] && [ "$message" != "null" ] && [ "$chat_id" = "$CHAT_ID" ]; then
                 # 提取命令和参数
                 cmd=$(echo "$message" | awk '{print $1}')
-                param=$(echo "$message" | cut -d' ' -f2- | sed 's/^ *//')
-                [ "$param" = "$cmd" ] && param=""
+                param=""
+                
+                # 检查是否有参数（命令后有空格和内容）
+                if echo "$message" | grep -q " "; then
+                    param=$(echo "$message" | sed 's/^[^ ]* *//')
+                fi
                 
                 case "$cmd" in
-                    /status*) handle_status_command "$chat_id" ;;
-                    /update*) handle_update_command "$chat_id" "$message_id" "$param" ;;
-                    /restart*) handle_restart_command "$chat_id" "$message_id" "$param" ;;
-                    /runonce*) handle_runonce_command "$chat_id" ;;
-                    /monitor*) handle_monitor_command "$chat_id" ;;
-                    /help*) handle_help_command ;;
-                    /start*) handle_help_command ;;
+                    /status) handle_status_command "$chat_id" ;;
+                    /update) handle_update_command "$chat_id" "$message_id" "$param" ;;
+                    /restart) handle_restart_command "$chat_id" "$message_id" "$param" ;;
+                    /runonce) handle_runonce_command "$chat_id" ;;
+                    /monitor) handle_monitor_command "$chat_id" ;;
+                    /help) handle_help_command ;;
+                    /start) handle_help_command ;;
                 esac
             fi
             
@@ -882,9 +886,6 @@ ${monitor_list}
    /runonce - 立即检查更新
    /monitor - 监控管理
    /help - 显示帮助
-
-🔄 <b>功能配置</b>
-   检查间隔: <code>$((POLL_INTERVAL / 60))分钟</code>
 
 ⏰ <b>启动时间</b>
    <code>$(get_time)</code>
