@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Docker 容器监控通知服务 v5.2.1
-修复 NFS 文件同步和 JSON 读写冲突问题
+Docker 容器监控通知服务 v5.2.2
+修复回调处理需要点击两次的问题
 """
 
 import os
@@ -21,7 +21,7 @@ from pathlib import Path
 
 # ==================== 配置和常量 ====================
 
-VERSION = "5.2.1"
+VERSION = "5.2.2"
 TELEGRAM_API = f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN')}"
 CHAT_ID = os.getenv('CHAT_ID')
 SERVER_NAME = os.getenv('SERVER_NAME')
@@ -51,16 +51,16 @@ shutdown_flag = threading.Event()
 
 class FileLock:
     """文件锁上下文管理器"""
-    
+
     def __init__(self, file_path: Path, timeout: int = 10):
         self.file_path = file_path
         self.timeout = timeout
         self.lock_file = None
-        
+
     def __enter__(self):
         lock_path = str(self.file_path) + '.lock'
         self.lock_file = open(lock_path, 'w')
-        
+
         start_time = time.time()
         while True:
             try:
@@ -70,7 +70,7 @@ class FileLock:
                 if time.time() - start_time > self.timeout:
                     raise TimeoutError(f"无法获取文件锁: {self.file_path}")
                 time.sleep(0.1)
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.lock_file:
             try:
@@ -84,27 +84,27 @@ def safe_read_json(file_path: Path, default: Dict = None, max_retries: int = 3) 
     """安全读取 JSON 文件（带重试和文件锁）"""
     if default is None:
         default = {}
-    
+
     for attempt in range(max_retries):
         try:
             if not file_path.exists():
                 logger.debug(f"文件不存在，返回默认值: {file_path}")
                 return default.copy()
-            
+
             # 使用文件锁
             with FileLock(file_path, timeout=5):
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read().strip()
-                    
+
                     # 检查文件是否为空
                     if not content:
                         logger.warning(f"文件为空: {file_path}")
                         return default.copy()
-                    
+
                     # 尝试解析 JSON
                     data = json.loads(content)
                     return data
-                    
+
         except json.JSONDecodeError as e:
             logger.error(f"JSON 解析失败 (尝试 {attempt + 1}/{max_retries}): {file_path} - {e}")
             if attempt < max_retries - 1:
@@ -112,21 +112,21 @@ def safe_read_json(file_path: Path, default: Dict = None, max_retries: int = 3) 
             else:
                 logger.error(f"JSON 文件损坏，返回默认值: {file_path}")
                 return default.copy()
-                
+
         except TimeoutError as e:
             logger.error(f"获取文件锁超时 (尝试 {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(1)
             else:
                 return default.copy()
-                
+
         except Exception as e:
             logger.error(f"读取文件失败 (尝试 {attempt + 1}/{max_retries}): {file_path} - {e}")
             if attempt < max_retries - 1:
                 time.sleep(0.5)
             else:
                 return default.copy()
-    
+
     return default.copy()
 
 
@@ -142,21 +142,21 @@ def safe_write_json(file_path: Path, data: Dict, max_retries: int = 3) -> bool:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                     f.flush()
                     os.fsync(f.fileno())  # 强制写入磁盘
-                
+
                 # 原子性替换
                 temp_path.replace(file_path)
                 return True
-                
+
         except TimeoutError as e:
             logger.error(f"获取文件锁超时 (尝试 {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(1)
-                
+
         except Exception as e:
             logger.error(f"写入文件失败 (尝试 {attempt + 1}/{max_retries}): {file_path} - {e}")
             if attempt < max_retries - 1:
                 time.sleep(0.5)
-    
+
     return False
 
 
@@ -171,11 +171,11 @@ class CommandCoordinator:
 
     def should_handle_command(self, command: str, callback_data: str = None) -> bool:
         """判断当前服务器是否应该处理该命令或回调"""
-        
+
         # 如果是回调数据，检查是否包含服务器标识
         if callback_data:
             return self._should_handle_callback(callback_data)
-        
+
         # 不需要协调的命令（全局命令，需要所有服务器响应）
         global_commands = ['/start']
         if any(command.startswith(cmd) for cmd in global_commands):
@@ -211,8 +211,8 @@ class CommandCoordinator:
         # 解析回调数据
         parts = callback_data.split(':')
         action = parts[0]
-        
-        # 不包含服务器信息的回调，需要协调
+
+        # 不包含服务器信息的回调，需要协调（仅由协调者处理第一步：显示服务器列表）
         non_server_callbacks = ['monitor_action', 'cancel']
         if action in non_server_callbacks:
             servers = self._get_active_servers()
@@ -220,21 +220,21 @@ class CommandCoordinator:
                 return True
             coordinator = sorted(servers)[0]
             return self.server_name == coordinator
-        
-        # 包含服务器信息的回调
+
+        # 包含服务器信息的回调 - 由目标服务器处理
         if len(parts) >= 2:
-            if action in ['status_srv', 'update_srv', 'restart_srv', 'monitor_srv']:
-                target_server = parts[1]
-                should_handle = (target_server == self.server_name)
-                logger.info(f"回调目标: {target_server}, 当前: {self.server_name}, 处理: {should_handle}")
-                return should_handle
+            # 这些回调的第二个参数是目标服务器
+            server_target_actions = [
+                'status_srv', 'update_srv', 'restart_srv', 'monitor_srv',
+                'update_cnt', 'restart_cnt', 'confirm_restart', 'add_mon', 'rem_mon'
+            ]
             
-            if action in ['update_cnt', 'restart_cnt', 'confirm_restart', 'add_mon', 'rem_mon']:
+            if action in server_target_actions:
                 target_server = parts[1]
                 should_handle = (target_server == self.server_name)
-                logger.info(f"回调目标: {target_server}, 当前: {self.server_name}, 处理: {should_handle}")
+                logger.info(f"回调 {action} 目标: {target_server}, 当前: {self.server_name}, 处理: {should_handle}")
                 return should_handle
-        
+
         # 默认：让协调者处理
         servers = self._get_active_servers()
         if len(servers) <= 1:
@@ -245,7 +245,7 @@ class CommandCoordinator:
     def _get_active_servers(self) -> List[str]:
         """获取活跃的服务器列表"""
         registry = safe_read_json(self.registry_file, default={})
-        
+
         if not registry:
             return [self.server_name]
 
@@ -568,10 +568,6 @@ class CommandHandler:
 
     def _show_server_status(self, chat_id: str, server: str):
         """显示指定服务器的状态"""
-        if server != SERVER_NAME:
-            logger.info(f"状态查询目标是 {server}，当前是 {SERVER_NAME}，跳过")
-            return
-
         all_containers = self.docker.get_all_containers()
         monitored = [c for c in all_containers if self.config.is_monitored(c)]
         excluded = self.config.get_excluded_containers()
@@ -629,10 +625,6 @@ class CommandHandler:
 
     def _show_update_containers(self, chat_id: str, server: str):
         """显示可更新的容器列表"""
-        if server != SERVER_NAME:
-            logger.info(f"更新目标是 {server}，当前是 {SERVER_NAME}，跳过")
-            return
-
         containers = [c for c in self.docker.get_all_containers() 
                      if self.config.is_monitored(c)]
 
@@ -672,10 +664,6 @@ class CommandHandler:
 
     def _show_restart_containers(self, chat_id: str, server: str):
         """显示可重启的容器列表"""
-        if server != SERVER_NAME:
-            logger.info(f"重启目标是 {server}，当前是 {SERVER_NAME}，跳过")
-            return
-
         containers = self.docker.get_all_containers()
 
         if not containers:
@@ -755,10 +743,6 @@ class CommandHandler:
 
         elif action == 'update_cnt':
             server, container = parts[1], parts[2]
-            if server != SERVER_NAME:
-                logger.info(f"更新容器目标是 {server}，当前是 {SERVER_NAME}，跳过")
-                return
-
             self.bot.answer_callback(callback_query_id, "正在准备更新...")
             self.bot.edit_message(
                 chat_id, message_id,
@@ -772,10 +756,6 @@ class CommandHandler:
 
         elif action == 'restart_cnt':
             server, container = parts[1], parts[2]
-            if server != SERVER_NAME:
-                logger.info(f"重启目标是 {server}，当前是 {SERVER_NAME}，跳过")
-                return
-
             confirm_msg = f"""⚠️ <b>确认重启</b>
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -797,10 +777,6 @@ class CommandHandler:
 
         elif action == 'confirm_restart':
             server, container = parts[1], parts[2]
-            if server != SERVER_NAME:
-                logger.info(f"确认重启目标是 {server}，当前是 {SERVER_NAME}，跳过")
-                return
-
             self.bot.answer_callback(callback_query_id, "开始重启容器...")
             self.bot.edit_message(
                 chat_id, message_id,
@@ -864,10 +840,6 @@ class CommandHandler:
 
         elif action == 'add_mon':
             server, container = parts[1], parts[2]
-            if server != SERVER_NAME:
-                logger.info(f"添加监控目标是 {server}，当前是 {SERVER_NAME}，跳过")
-                return
-
             self.config.remove_excluded(container)
             self.bot.answer_callback(callback_query_id, "已添加到监控列表")
             self.bot.edit_message(
@@ -884,10 +856,6 @@ class CommandHandler:
 
         elif action == 'rem_mon':
             server, container = parts[1], parts[2]
-            if server != SERVER_NAME:
-                logger.info(f"移除监控目标是 {server}，当前是 {SERVER_NAME}，跳过")
-                return
-
             self.config.add_excluded(container)
             self.bot.answer_callback(callback_query_id, "已从监控列表移除")
             self.bot.edit_message(
@@ -909,10 +877,6 @@ class CommandHandler:
     def _handle_monitor_server(self, chat_id: str, message_id: str, 
                                action: str, server: str):
         """处理监控服务器选择"""
-        if server != SERVER_NAME:
-            logger.info(f"监控管理目标是 {server}，当前是 {SERVER_NAME}，跳过")
-            return
-
         if action == 'add':
             excluded = self.config.get_excluded_containers()
             if not excluded:
@@ -1342,7 +1306,7 @@ def main():
     # 等待一下，让其他服务器先注册
     logger.info("等待 2 秒后注册服务器...")
     time.sleep(2)
-    
+
     registry.register()
 
     handler = CommandHandler(bot, docker, config, registry)
@@ -1387,11 +1351,10 @@ def main():
    /monitor - 监控管理
    /help - 显示帮助
 
-💡 <b>修复内容 v5.2.1</b>
-   • 添加文件锁机制防止冲突
-   • 改进 JSON 读写安全性
-   • 增加重试机制
-   • 修复 NFS 同步问题
+💡 <b>修复内容 v5.2.2</b>
+   • 修复回调处理需要点击两次的问题
+   • 优化服务器选择和容器列表显示
+   • 改进回调协调逻辑
 
 ⏰ <b>启动时间</b>
    <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
